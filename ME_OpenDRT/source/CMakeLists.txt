@@ -4,6 +4,7 @@ project(ME_OpenDRT VERSION 1.1.0 LANGUAGES CXX)
 
 set(PLUGIN_BASENAME "ME_OpenDRT")
 option(ME_OPENDRT_LINUX_CUDA "Enable CUDA backend on Linux builds" ON)
+option(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB "Build cube-viewer transport stub (research)" ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -197,6 +198,68 @@ set_target_properties(${PLUGIN_BASENAME} PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO "${OFX_OUTPUT_DIR}"
   LIBRARY_OUTPUT_DIRECTORY_MINSIZEREL "${OFX_OUTPUT_DIR}"
 )
+
+if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
+  find_package(OpenGL REQUIRED)
+  find_package(glfw3 QUIET)
+  if(NOT glfw3_FOUND AND NOT WIN32)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+      pkg_check_modules(GLFW3 QUIET IMPORTED_TARGET glfw3)
+    endif()
+  endif()
+  if(NOT glfw3_FOUND AND NOT TARGET PkgConfig::GLFW3)
+    include(FetchContent)
+    FetchContent_Declare(
+      glfw
+      GIT_REPOSITORY https://github.com/glfw/glfw.git
+      GIT_TAG 3.4
+      GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(glfw)
+  endif()
+
+  add_executable(ME_OpenDRT_CubeViewer tools/cube_viewer_stub/main.cpp)
+  target_compile_features(ME_OpenDRT_CubeViewer PRIVATE cxx_std_17)
+  # Keep companion viewer portable and low-risk: CPU-only processor path,
+  # independent from plugin CUDA/OpenCL/Metal backend toolchains.
+  target_compile_definitions(ME_OpenDRT_CubeViewer PRIVATE ME_OPENDRT_VIEWER_CPU_ONLY)
+  target_include_directories(ME_OpenDRT_CubeViewer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk/Support/include
+    $<$<BOOL:${OPENCL_KERNEL_HDR_DIR}>:${OPENCL_KERNEL_HDR_DIR}>
+  )
+  add_dependencies(${PLUGIN_BASENAME} ME_OpenDRT_CubeViewer)
+  if(TARGET OpenDRTOpenCLSourceHeader)
+    add_dependencies(ME_OpenDRT_CubeViewer OpenDRTOpenCLSourceHeader)
+  endif()
+  if(TARGET glfw)
+    target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE glfw)
+  elseif(TARGET glfw3::glfw)
+    target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE glfw3::glfw)
+  elseif(TARGET PkgConfig::GLFW3)
+    target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE PkgConfig::GLFW3)
+  endif()
+  if(TARGET OpenGL::GL)
+    target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE OpenGL::GL)
+  elseif(TARGET OpenGL::OpenGL)
+    target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE OpenGL::OpenGL)
+  else()
+    message(FATAL_ERROR "No compatible OpenGL CMake target found for ME_OpenDRT_CubeViewer")
+  endif()
+  if(WIN32)
+    target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE ws2_32 user32 gdi32)
+  endif()
+  set_target_properties(ME_OpenDRT_CubeViewer PROPERTIES
+    WIN32_EXECUTABLE $<BOOL:${WIN32}>
+    RUNTIME_OUTPUT_DIRECTORY "${OFX_OUTPUT_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${OFX_OUTPUT_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${OFX_OUTPUT_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${OFX_OUTPUT_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${OFX_OUTPUT_DIR}"
+  )
+endif()
 
 
 

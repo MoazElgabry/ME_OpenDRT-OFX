@@ -1,4 +1,4 @@
-name: Build ME_OpenDRT All Platforms (macOS + Linux + Windows)
+﻿name: Build ME_OpenDRT All Platforms (macOS + Linux + Windows)
 
 on:
   workflow_dispatch:
@@ -35,7 +35,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure Ninja is available
+      - name: Ensure build tools are available
         run: |
           if command -v ninja >/dev/null 2>&1; then
             echo "ninja already available: $(command -v ninja)"
@@ -43,9 +43,14 @@ jobs:
           else
             brew install ninja
           fi
+          if brew list --versions glfw >/dev/null 2>&1; then
+            echo "glfw already installed"
+          else
+            brew install glfw
+          fi
 
       - name: Configure
-        run: cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+        run: cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DME_OPENDRT_BUILD_CUBE_VIEWER_STUB=ON
 
       - name: Build
         run: cmake --build build-mac --config Release
@@ -53,6 +58,7 @@ jobs:
       - name: Verify bundle outputs
         run: |
           test -f bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx
+          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT_CubeViewer
           test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib
           otool -l bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
           strings bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib | grep -E -q "air64-apple-macosx13(\\.|$)"
@@ -92,7 +98,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++ ocl-icd-opencl-dev
+          sudo apt-get install -y cmake ninja-build g++ ocl-icd-opencl-dev libglfw3-dev libgl1-mesa-dev
           if [ "${{ matrix.variant.linux_cuda }}" = "ON" ]; then
             sudo apt-get install -y nvidia-cuda-toolkit
           fi
@@ -101,7 +107,8 @@ jobs:
         run: |
           cmake -S . -B build-linux -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DME_OPENDRT_LINUX_CUDA=${{ matrix.variant.linux_cuda }}
+            -DME_OPENDRT_LINUX_CUDA=${{ matrix.variant.linux_cuda }} \
+            -DME_OPENDRT_BUILD_CUBE_VIEWER_STUB=ON
 
       - name: Build
         run: cmake --build build-linux --config Release -j
@@ -109,6 +116,7 @@ jobs:
       - name: Verify bundle outputs
         run: |
           test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Linux-x86-64/ME_OpenDRT.ofx
+          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Linux-x86-64/ME_OpenDRT_CubeViewer
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
@@ -169,7 +177,7 @@ jobs:
         run: choco install ninja --no-progress -y
 
       - name: Configure
-        run: cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DME_OPENDRT_BUILD_CUBE_VIEWER_STUB=ON
 
       - name: Build
         run: cmake --build build-win --config Release
@@ -179,10 +187,12 @@ jobs:
           if (!(Test-Path "bundle/ME_OpenDRT.ofx.bundle/Contents/Win64/ME_OpenDRT.ofx")) {
             throw "Missing Windows plugin binary"
           }
+          if (!(Test-Path "bundle/ME_OpenDRT.ofx.bundle/Contents/Win64/ME_OpenDRT_CubeViewer.exe")) {
+            throw "Missing Windows cube viewer binary"
+          }
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: ME_OpenDRT-v1.1.0-rc1-windows-x86_64-bundle
           path: ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
-

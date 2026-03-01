@@ -2,17 +2,34 @@
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
+#include <cstdint>
+#include <cstring>
 #if !defined(__linux__)
 #include <filesystem>
 #endif
 #include <fstream>
 #include <cstdio>
+#include <atomic>
 #include <mutex>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#include <spawn.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+extern char** environ;
+#endif
 #if defined(__linux__)
 #include <cerrno>
 #include <sys/stat.h>
@@ -175,6 +192,221 @@ void perfLog(const char* stage, const std::chrono::steady_clock::time_point& sta
       std::fclose(f);
     }
   }
+#endif
+}
+
+// ===== Companion Viewer Transport Helpers (Phase 1 Scaffold) =====
+// The plugin never blocks render threads waiting for this channel.
+// Messages are best-effort and fire only from UI param-change paths.
+std::string cubeViewerPipeName() {
+  const char* env = std::getenv("ME_OPENDRT_CUBE_VIEWER_PIPE");
+  if (env && env[0] != '\0') return std::string(env);
+#if defined(_WIN32)
+  return "\\\\.\\pipe\\ME_OpenDRT_CubeViewer";
+#else
+  return "/tmp/me_opendrt_cube_viewer.sock";
+#endif
+}
+
+std::string cubeViewerExeName() {
+#if defined(_WIN32)
+  return "ME_OpenDRT_CubeViewer.exe";
+#else
+  return "ME_OpenDRT_CubeViewer";
+#endif
+}
+
+std::string parentDir(const std::string& path) {
+  const size_t p = path.find_last_of("/\\");
+  if (p == std::string::npos) return std::string();
+  return path.substr(0, p);
+}
+
+std::string joinPath(const std::string& a, const std::string& b) {
+  if (a.empty()) return b;
+  const char last = a.back();
+  if (last == '/' || last == '\\') return a + b;
+#if defined(_WIN32)
+  return a + "\\" + b;
+#else
+  return a + "/" + b;
+#endif
+}
+
+bool isAbsolutePath(const std::string& p) {
+  if (p.empty()) return false;
+#if defined(_WIN32)
+  if (p.size() >= 2 && std::isalpha(static_cast<unsigned char>(p[0])) && p[1] == ':') return true;
+  if (p.size() >= 2 && p[0] == '\\' && p[1] == '\\') return true;
+  return false;
+#else
+  return p[0] == '/';
+#endif
+}
+
+bool fileExistsForLaunch(const std::string& p) {
+  if (p.empty()) return false;
+#if defined(_WIN32)
+  const DWORD attrs = GetFileAttributesA(p.c_str());
+  if (attrs == INVALID_FILE_ATTRIBUTES) return false;
+  return (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+#else
+  return ::access(p.c_str(), X_OK) == 0;
+#endif
+}
+
+std::string pluginModulePath() {
+#if defined(_WIN32)
+  HMODULE module = nullptr;
+  if (!GetModuleHandleExA(
+          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCSTR>(&pluginModulePath),
+          &module)) {
+    return std::string();
+  }
+  char buf[MAX_PATH] = {0};
+  const DWORD n = GetModuleFileNameA(module, buf, static_cast<DWORD>(sizeof(buf)));
+  if (n == 0 || n >= sizeof(buf)) return std::string();
+  return std::string(buf, n);
+#else
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<void*>(&pluginModulePath), &info) == 0 || info.dli_fname == nullptr) {
+    return std::string();
+  }
+  return std::string(info.dli_fname);
+#endif
+}
+
+std::vector<std::string> cubeViewerExeCandidates() {
+  std::vector<std::string> out;
+  const std::string exeName = cubeViewerExeName();
+  const std::string modulePath = pluginModulePath();
+  const std::string moduleDir = parentDir(modulePath);
+  const char* env = std::getenv("ME_OPENDRT_CUBE_VIEWER_EXE");
+  if (env && env[0] != '\0') {
+    const std::string envPath(env);
+    out.push_back(envPath);
+    if (!isAbsolutePath(envPath) && !moduleDir.empty()) out.push_back(joinPath(moduleDir, envPath));
+  }
+  if (!moduleDir.empty()) {
+    out.push_back(joinPath(moduleDir, exeName));
+    const std::string win64Dir = moduleDir;
+    const std::string contentsDir = parentDir(win64Dir);
+    if (!contentsDir.empty()) {
+      out.push_back(joinPath(contentsDir, exeName));
+      out.push_back(joinPath(joinPath(contentsDir, "Resources"), exeName));
+    }
+  }
+  out.push_back(exeName); // final PATH fallback
+  return out;
+}
+
+// Viewer process bootstrap: resolve executable candidates from env/bundle/PATH and launch asynchronously.
+bool launchCubeViewerProcessAsync(std::string* errorOut, std::string* launchedPathOut, uint32_t* launchedPidOut) {
+  const std::vector<std::string> candidates = cubeViewerExeCandidates();
+  std::ostringstream attempted;
+  bool attemptedAny = false;
+  for (const std::string& candidate : candidates) {
+    if (candidate.empty()) continue;
+    const bool literalCandidate = (candidate == cubeViewerExeName());
+    if (!literalCandidate && !fileExistsForLaunch(candidate)) {
+      attempted << (attemptedAny ? "; " : "") << candidate;
+      attemptedAny = true;
+      continue;
+    }
+#if defined(_WIN32)
+    STARTUPINFOA si{};
+    PROCESS_INFORMATION pi{};
+    si.cb = sizeof(si);
+    std::string cmdLine = "\"" + candidate + "\"";
+    const BOOL ok = CreateProcessA(
+        nullptr,
+        &cmdLine[0],
+        nullptr,
+        nullptr,
+        FALSE,
+        CREATE_NEW_PROCESS_GROUP,
+        nullptr,
+        nullptr,
+        &si,
+        &pi);
+    if (ok == TRUE) {
+      if (launchedPidOut) *launchedPidOut = static_cast<uint32_t>(pi.dwProcessId);
+      CloseHandle(pi.hThread);
+      CloseHandle(pi.hProcess);
+      if (launchedPathOut) *launchedPathOut = candidate;
+      return true;
+    }
+    const DWORD err = GetLastError();
+    attempted << (attemptedAny ? "; " : "") << candidate << " (err=" << err << ")";
+    attemptedAny = true;
+#else
+    pid_t pid = 0;
+    char* const argv[] = {const_cast<char*>(candidate.c_str()), nullptr};
+    const int rc = posix_spawn(&pid, candidate.c_str(), nullptr, nullptr, argv, environ);
+    if (rc == 0) {
+      if (launchedPidOut) *launchedPidOut = static_cast<uint32_t>(pid);
+      if (launchedPathOut) *launchedPathOut = candidate;
+      return true;
+    }
+    attempted << (attemptedAny ? "; " : "") << candidate << " (err=" << rc << ")";
+    attemptedAny = true;
+#endif
+  }
+  if (errorOut) {
+    if (!attemptedAny) {
+      *errorOut = "viewer executable not found";
+    } else {
+      *errorOut = std::string("viewer executable not found. attempted: ") + attempted.str();
+    }
+  }
+  return false;
+}
+
+// Connection transport primitive: fire-and-forget single-message send to viewer IPC endpoint.
+bool sendCubeViewerMessage(const std::string& msg) {
+  if (msg.empty()) return false;
+#if defined(_WIN32)
+  const std::string pipeName = cubeViewerPipeName();
+  HANDLE h = CreateFileA(
+      pipeName.c_str(),
+      GENERIC_WRITE,
+      0,
+      nullptr,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  std::string payload = msg;
+  payload.push_back('\n');
+  DWORD written = 0;
+  const BOOL ok = WriteFile(h, payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr);
+  CloseHandle(h);
+  return ok == TRUE && written == payload.size();
+#else
+  int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) return false;
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  const std::string path = cubeViewerPipeName();
+  if (path.size() >= sizeof(addr.sun_path)) {
+    ::close(fd);
+    return false;
+  }
+  std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+  if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return false;
+  }
+  std::string payload = msg;
+  payload.push_back('\n');
+  int sendFlags = 0;
+#ifdef MSG_NOSIGNAL
+  sendFlags |= MSG_NOSIGNAL;
+#endif
+  const ssize_t sent = ::send(fd, payload.data(), payload.size(), sendFlags);
+  ::close(fd);
+  return sent == static_cast<ssize_t>(payload.size());
 #endif
 }
 
@@ -1664,7 +1896,14 @@ const char* tooltipForParam(const std::string& name) {
     {"tn_su", "Surround compensation mode (dark, dim, bright)."},
     {"display_gamut", "Target display gamut."},
     {"eotf", "Target display transfer function."},
-    {"crv_enable", "Draw tonescale overlay for curve debugging/inspection."}
+    {"crv_enable", "Draw tonescale overlay for curve debugging/inspection."},
+    {"openCubeViewer", "Open the external 3D identity-cube viewer (experimental)."},
+    {"closeCubeViewer", "Disconnect this OFX instance from the viewer. The viewer window stays open and can be re-attached via Open."},
+    {"cubeViewerLive", "When enabled, parameter edits stream to the external viewer. Disabled means on-demand/manual updates only."},
+    {"cubeViewerIdentity", "Toggle visualization source: ON uses transformed identity cube, OFF uses transformed input-image point cloud."},
+    {"cubeViewerOnTop", "Keep the external viewer window above the host while tweaking controls."},
+    {"cubeViewerQuality", "Viewer cube density for live updates (Low=17^3, Medium=33^3, High=65^3)."},
+    {"cubeViewerStatus", "Connection state for external 3D identity-cube viewer."}
   };
   auto it = kTooltips.find(name);
   return it == kTooltips.end() ? nullptr : it->second;
@@ -1683,9 +1922,15 @@ class OpenDRTEffect : public OFX::ImageEffect {
     updateToggleVisibility(0.0);
     updatePresetManagerActionState(0.0);
     updateReadonlyDisplayLabels(0.0);
+    cubeViewerLive_ = getBool("cubeViewerLive", 0.0, 1) != 0;
+    cubeViewerQuality_ = getChoice("cubeViewerQuality", 0.0, 1);
+    setBool("cubeViewerIdentity", getChoice("cubeViewerSource", 0.0, 0) == 0 ? 1 : 0);
+    setCubeViewerStatusLabel("Disconnected");
   }
 
   ~OpenDRTEffect() override {
+    allowUiParamWrites_ = false;
+    closeCubeViewerSession();
 #if defined(OFX_SUPPORTS_CUDARENDER)
     if (stageSrcPinned_ != nullptr) {
       cudaFreeHost(stageSrcPinned_);
@@ -1702,8 +1947,10 @@ class OpenDRTEffect : public OFX::ImageEffect {
   // ===== Render Path Entry =====
   // Main render callback.
   // Rule: keep preset/file management out of this path for predictable playback.
-  void render(const OFX::RenderArguments& args) override {
+  // Render stage map: (1) validate clips/layout, (2) resolve params, (3) pick backend, (4) optional viewer cloud publish.
+void render(const OFX::RenderArguments& args) override {
     const auto tRenderStart = std::chrono::steady_clock::now();
+    refreshCubeViewerRuntimeStateRenderSafe();
     std::unique_ptr<OFX::Image> src(srcClip_->fetchImage(args.time));
     std::unique_ptr<OFX::Image> dst(dstClip_->fetchImage(args.time));
 
@@ -1766,6 +2013,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     OpenDRTRawValues raw = readRawValues(args.time);
     OpenDRTParams params = resolveParams(raw);
     perfLog("Param resolve", tResolveStart);
+    const bool wantInputCloud = cubeViewerRequested_ && cubeViewerLive_ && (getBool("cubeViewerIdentity", args.time, 1) == 0);
 
     if (!processor_) {
       processor_ = std::make_unique<OpenDRTProcessor>(params);
@@ -1793,6 +2041,50 @@ class OpenDRTEffect : public OFX::ImageEffect {
       const size_t dstRowBytes = dstRb < 0 ? static_cast<size_t>(-dstRb) : static_cast<size_t>(dstRb);
       if (srcDevice != nullptr && dstDevice != nullptr &&
           processor_->renderCUDAHostBuffers(srcDevice, dstDevice, width, height, srcRowBytes, dstRowBytes, args.pCudaStream)) {
+        if (wantInputCloud && shouldEmitCubeViewerInputCloud(args.time)) {
+          const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+          if (ensureStageBuffers(pixelCount)) {
+            float* srcStage = stageSrcPtr();
+            float* dstStage = stageDstPtr();
+            if (srcStage != nullptr && dstStage != nullptr) {
+              cudaStream_t hostStream = reinterpret_cast<cudaStream_t>(args.pCudaStream);
+              const size_t cloudRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+              const cudaError_t eSrc = cudaMemcpy2DAsync(
+                  srcStage,
+                  cloudRowBytes,
+                  srcDevice,
+                  srcRowBytes,
+                  cloudRowBytes,
+                  static_cast<size_t>(height),
+                  cudaMemcpyDeviceToHost,
+                  hostStream);
+              const cudaError_t eDst = cudaMemcpy2DAsync(
+                  dstStage,
+                  cloudRowBytes,
+                  dstDevice,
+                  dstRowBytes,
+                  cloudRowBytes,
+                  static_cast<size_t>(height),
+                  cudaMemcpyDeviceToHost,
+                  hostStream);
+              if (eSrc == cudaSuccess && eDst == cudaSuccess) {
+                const cudaError_t eSync = cudaStreamSynchronize(hostStream);
+                if (eSync == cudaSuccess) {
+                  (void)emitCubeViewerInputCloud(
+                      srcStage, cloudRowBytes, dstStage, cloudRowBytes, width, height);
+                } else if (debugLogEnabled()) {
+                  std::fprintf(stderr, "[ME_OpenDRT] Cube input cloud CUDA sync failed: %s\n", cudaGetErrorString(eSync));
+                }
+              } else if (debugLogEnabled()) {
+                std::fprintf(
+                    stderr,
+                    "[ME_OpenDRT] Cube input cloud CUDA copy failed: src=%s dst=%s\n",
+                    cudaGetErrorString(eSrc),
+                    cudaGetErrorString(eDst));
+              }
+            }
+          }
+        }
         perfLog("Backend render host CUDA", tHostCuda);
         perfLog("Render total", tRenderStart);
         return;
@@ -1837,11 +2129,21 @@ class OpenDRTEffect : public OFX::ImageEffect {
 #endif
 
     bool rendered = false;
+    const float* renderedSrcBase = nullptr;
+    const float* renderedDstBase = nullptr;
+    size_t renderedSrcPitch = 0;
+    size_t renderedDstPitch = 0;
     // Fast path: process directly on host image memory layout (no extra staging vectors).
     if (!forceStageCopyEnabled() && srcLayout.valid && dstLayout.valid) {
       const auto tBackendDirect = std::chrono::steady_clock::now();
       rendered = processor_->renderWithLayout(
           srcLayout.base, dstLayout.base, width, height, srcLayout.pitchBytes, dstLayout.pitchBytes, true, false);
+      if (rendered) {
+        renderedSrcBase = srcLayout.base;
+        renderedDstBase = dstLayout.base;
+        renderedSrcPitch = srcLayout.pitchBytes;
+        renderedDstPitch = dstLayout.pitchBytes;
+      }
       perfLog("Backend render direct", tBackendDirect);
     }
 
@@ -1895,6 +2197,15 @@ class OpenDRTEffect : public OFX::ImageEffect {
         }
       }
       perfLog("Host dst copy", tDstCopyStart);
+      renderedSrcBase = srcStage;
+      renderedDstBase = dstStage;
+      renderedSrcPitch = rowBytes;
+      renderedDstPitch = rowBytes;
+    }
+
+    if (rendered) {
+      (void)pushCubeViewerInputCloud(
+          args.time, renderedSrcBase, renderedSrcPitch, renderedDstBase, renderedDstPitch, width, height);
     }
 
     perfLog("Render total", tRenderStart);
@@ -1903,8 +2214,10 @@ class OpenDRTEffect : public OFX::ImageEffect {
   // ===== UI Event Entry =====
   // UI/param callback entry point.
   // Keep this deterministic: mutate params/state, then refresh dependent UI labels/states.
-  void changedParam(const OFX::InstanceChangedArgs& args, const std::string& paramName) override {
+  // UI event router: handles viewer actions first, then preset orchestration, then generic change propagation.
+void changedParam(const OFX::InstanceChangedArgs& args, const std::string& paramName) override {
     try {
+      refreshCubeViewerConnectionHealth();
       if (suppressParamChanged_) {
         return;
       }
@@ -1916,6 +2229,53 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
       if (paramName == "activeUserLookSlot" || paramName == "activeUserToneSlot") {
+        return;
+      }
+
+      // ----- Companion Viewer Controls (experimental) -----
+      // All actions here are non-blocking and on-demand.
+      if (paramName == "openCubeViewer") {
+        openCubeViewerSession(args.time);
+        return;
+      }
+      if (paramName == "closeCubeViewer") {
+        closeCubeViewerSession();
+        return;
+      }
+      if (paramName == "cubeViewerLive") {
+        cubeViewerLive_ = getBool("cubeViewerLive", args.time, 1) != 0;
+        if (cubeViewerRequested_ && cubeViewerLive_) {
+          pushCubeViewerUpdate(args.time, paramName, true);
+        } else if (cubeViewerRequested_) {
+          setCubeViewerStatusLabel("Connected");
+        }
+        return;
+      }
+      if (paramName == "cubeViewerQuality") {
+        cubeViewerQuality_ = getChoice("cubeViewerQuality", args.time, 1);
+        if (cubeViewerRequested_ && cubeViewerLive_) {
+          pushCubeViewerUpdate(args.time, paramName, true);
+        }
+        return;
+      }
+      if (paramName == "cubeViewerOnTop") {
+        if (cubeViewerRequested_) {
+          pushCubeViewerUpdate(args.time, paramName, true);
+        }
+        return;
+      }
+      if (paramName == "cubeViewerIdentity") {
+        setChoice("cubeViewerSource", getBool("cubeViewerIdentity", args.time, 1) ? 0 : 1);
+        if (cubeViewerRequested_ && cubeViewerLive_) {
+          pushCubeViewerUpdate(args.time, paramName, true);
+        }
+        return;
+      }
+      if (paramName == "cubeViewerSource") {
+        setBool("cubeViewerIdentity", getChoice("cubeViewerSource", args.time, 0) == 0 ? 1 : 0);
+        if (cubeViewerRequested_ && cubeViewerLive_) {
+          pushCubeViewerUpdate(args.time, paramName, true);
+        }
         return;
       }
 
@@ -1970,6 +2330,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         updatePresetManagerActionState(args.time);
         updateReadonlyDisplayLabels(args.time);
         updatePresetStateFromCurrent(args.time);
+        pushCubeViewerUpdate(args.time, paramName, true);
         return;
       }
 
@@ -1997,6 +2358,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         updatePresetManagerActionState(args.time);
         updatePresetStateFromCurrent(args.time);
         updateReadonlyDisplayLabels(args.time);
+        pushCubeViewerUpdate(args.time, paramName, true);
         return;
       }
 
@@ -2011,6 +2373,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         }
         updatePresetStateFromCurrent(args.time);
         updateReadonlyDisplayLabels(args.time);
+        pushCubeViewerUpdate(args.time, paramName, true);
         return;
       }
 
@@ -2021,6 +2384,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         writeDisplayPresetToParams(preset, *this);
         updatePresetStateFromCurrent(args.time);
         updateReadonlyDisplayLabels(args.time);
+        pushCubeViewerUpdate(args.time, paramName, true);
         return;
       }
 
@@ -2045,6 +2409,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         updatePresetManagerActionState(args.time);
         updateReadonlyDisplayLabels(args.time);
         updatePresetStateFromCurrent(args.time);
+        pushCubeViewerUpdate(args.time, paramName, true);
         return;
       }
 
@@ -2075,6 +2440,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         updatePresetManagerActionState(args.time);
         updateReadonlyDisplayLabels(args.time);
         updatePresetStateFromCurrent(args.time);
+        pushCubeViewerUpdate(args.time, paramName, true);
         return;
       }
 
@@ -2122,6 +2488,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         if (idx >= 0) setChoice("lookPreset", idx);
         writeLookValuesToParams(values, *this);
         updateToggleVisibility(args.time);
+        pushCubeViewerUpdate(args.time, paramName, true);
         return;
       }
 
@@ -2153,6 +2520,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         if (idx >= 0) setChoice("tonescalePreset", idx);
         writeTonescaleValuesToParams(values, *this);
         updateToggleVisibility(args.time);
+        pushCubeViewerUpdate(args.time, paramName, true);
         return;
       }
 
@@ -2223,6 +2591,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
           writeTonescaleValuesToParams(values, *this);
         }
         updateToggleVisibility(args.time);
+        pushCubeViewerUpdate(args.time, paramName, true);
         return;
       }
 
@@ -2249,6 +2618,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
           writeLookValuesToParams(values, *this);
           updatePresetStateFromCurrent(args.time);
           updateReadonlyDisplayLabels(args.time);
+          pushCubeViewerUpdate(args.time, paramName, true);
           return;
         }
         if (isUserTonescalePresetIndex(toneIdx)) {
@@ -2268,6 +2638,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
           writeTonescaleValuesToParams(values, *this);
           updatePresetStateFromCurrent(args.time);
           updateReadonlyDisplayLabels(args.time);
+          pushCubeViewerUpdate(args.time, paramName, true);
           return;
         }
         updatePresetManagerActionState(args.time);
@@ -2317,6 +2688,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
           syncPresetMenusFromDisk(args.time, 0, toneIdx);
           setChoice("lookPreset", 0);
           setInt("activeUserLookSlot", -1);
+          pushCubeViewerUpdate(args.time, paramName, true);
           return;
         }
         if (target == DeleteTarget::Tonescale) {
@@ -2340,6 +2712,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
           syncPresetMenusFromDisk(args.time, lookIdx, 0);
           setChoice("tonescalePreset", 0);
           setInt("activeUserToneSlot", -1);
+          pushCubeViewerUpdate(args.time, paramName, true);
           return;
         }
         return;
@@ -2350,6 +2723,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
       if (paramName == "userPresetRefresh") {
         FlagScope scope(suppressParamChanged_);
         syncPresetMenusFromDisk(args.time, getChoice("lookPreset", args.time, 0), getChoice("tonescalePreset", args.time, 0));
+        pushCubeViewerUpdate(args.time, paramName, true);
         return;
       }
 
@@ -2395,6 +2769,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
           syncPresetMenusFromDisk(args.time, lookIdx, toneIdx);
           setChoice("lookPreset", lookIdx);
           updateReadonlyDisplayLabels(args.time);
+          pushCubeViewerUpdate(args.time, paramName, true);
           return;
         }
         if (target == DeleteTarget::Tonescale) {
@@ -2417,6 +2792,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
           syncPresetMenusFromDisk(args.time, lookIdx, toneIdx);
           setChoice("tonescalePreset", toneIdx);
           updateReadonlyDisplayLabels(args.time);
+          pushCubeViewerUpdate(args.time, paramName, true);
           return;
         }
         return;
@@ -2486,6 +2862,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         }
         updatePresetStateFromCurrent(args.time);
         updateReadonlyDisplayLabels(args.time);
+        pushCubeViewerUpdate(args.time, paramName, false);
       }
     } catch (...) {
       // Swallow callback exceptions to avoid host crashes while stabilizing.
@@ -3302,8 +3679,362 @@ class OpenDRTEffect : public OFX::ImageEffect {
   void setInt(const char* name, int v) {
     if (auto* p = fetchIntParam(name)) p->setValue(v);
   }
+  void setBool(const char* name, int v) {
+    if (auto* p = fetchBooleanParam(name)) p->setValue(v != 0);
+  }
   void setString(const char* name, const std::string& v) {
     if (auto* p = fetchStringParam(name)) p->setValue(v);
+  }
+
+  int cubeViewerQualityToResolution(int quality) const {
+    if (quality <= 0) return 25;
+    if (quality == 1) return 41;
+    return 57;
+  }
+
+  std::string cubeViewerQualityName(int quality) const {
+    if (quality <= 0) return "Low";
+    if (quality == 1) return "Medium";
+    return "High";
+  }
+
+  std::string cubeViewerSourceModeName(int mode) const {
+    return mode == 0 ? "identity" : "input";
+  }
+
+  std::string cubeViewerSenderId() {
+    if (!cubeViewerSenderId_.empty()) return cubeViewerSenderId_;
+    std::ostringstream os;
+    os << "inst_" << static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(this));
+    cubeViewerSenderId_ = os.str();
+    return cubeViewerSenderId_;
+  }
+
+  void setCubeViewerStatusLabel(const std::string& status) {
+    if (cubeViewerStatusCache_ == status) return;
+    cubeViewerStatusCache_ = status;
+    if (!allowUiParamWrites_) return;
+    setString("cubeViewerStatus", status);
+  }
+
+  // Render-safe viewer liveness probe: never writes OFX params here; just updates internal gating flags.
+void refreshCubeViewerRuntimeStateRenderSafe() {
+    if (!cubeViewerRequested_) return;
+#if defined(_WIN32)
+    // Do not hard-reset viewer session state from render thread based on window lookup.
+    // The external GLFW viewer does not guarantee a stable Win32 class/title here,
+    // and false negatives would disable all live updates/cloud streaming.
+    cubeViewerWindowUsable_ = cubeViewerConnected_;
+#else
+    cubeViewerWindowUsable_ = cubeViewerConnected_;
+#endif
+  }
+
+  // UI-thread heartbeat: keeps status label truthful and detects stale/disconnected viewer sessions.
+void refreshCubeViewerConnectionHealth() {
+    if (!cubeViewerRequested_) return;
+#if defined(_WIN32)
+    if (cubeViewerProcessId_ != 0) {
+      HANDLE hProc = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(cubeViewerProcessId_));
+      if (hProc != nullptr) {
+        const DWORD waitRc = WaitForSingleObject(hProc, 0);
+        CloseHandle(hProc);
+        if (waitRc == WAIT_OBJECT_0) {
+          cubeViewerConnected_ = false;
+          cubeViewerRequested_ = false;
+          cubeViewerProcessId_ = 0;
+          cubeViewerWindowUsable_ = false;
+          setCubeViewerStatusLabel("Disconnected");
+          return;
+        }
+      }
+    }
+#endif
+    const auto now = std::chrono::steady_clock::now();
+    if (cubeViewerLastHeartbeatAt_ != std::chrono::steady_clock::time_point::min()) {
+      const auto elapsedMs =
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - cubeViewerLastHeartbeatAt_).count();
+      if (elapsedMs < 500) return;
+    }
+    cubeViewerLastHeartbeatAt_ = now;
+    if (sendCubeViewerMessage("{\"type\":\"heartbeat\"}")) {
+      cubeViewerConnected_ = true;
+      cubeViewerWindowUsable_ = true;
+      if (cubeViewerStatusCache_ == "Disconnected" || cubeViewerStatusCache_.find("failed") != std::string::npos) {
+        setCubeViewerStatusLabel("Connected");
+      }
+    } else {
+      cubeViewerConnected_ = false;
+      cubeViewerWindowUsable_ = false;
+      setCubeViewerStatusLabel("Disconnected");
+    }
+  }
+
+  // Snapshot/delta payload builder: canonical params + compact payloads for external cube visualization.
+std::string buildCubeViewerParamsJson(double time, bool deltaOnly, const std::string& changedParam) {
+    const OpenDRTRawValues raw = readRawValues(time);
+    std::string lookPayload;
+    std::string tonePayload;
+    serializeLookValues(captureCurrentLookValues(time), lookPayload);
+    serializeTonescaleValues(captureCurrentTonescaleValues(time), tonePayload);
+
+    std::ostringstream os;
+    os << "{";
+    os << "\"type\":\"" << (deltaOnly ? "params_delta" : "params_snapshot") << "\",";
+    os << "\"seq\":" << cubeViewerSeq_++ << ",";
+    os << "\"senderId\":\"" << cubeViewerSenderId() << "\",";
+    os << "\"quality\":\"" << cubeViewerQualityName(cubeViewerQuality_) << "\",";
+    os << "\"resolution\":" << cubeViewerQualityToResolution(cubeViewerQuality_) << ",";
+    os << "\"sourceMode\":\"" << cubeViewerSourceModeName(getBool("cubeViewerIdentity", time, 1) ? 0 : 1) << "\",";
+    os << "\"alwaysOnTop\":" << (getBool("cubeViewerOnTop", time, 0) ? 1 : 0) << ",";
+    os << "\"paramHash\":\"";
+    const std::string hashInput = lookPayload + "|" + tonePayload + "|" + std::to_string(raw.lookPreset) + "|" +
+                                  std::to_string(raw.tonescalePreset) + "|" + std::to_string(raw.creativeWhitePreset) +
+                                  "|" + std::to_string(raw.displayEncodingPreset);
+    os << std::hash<std::string>{}(hashInput) << "\",";
+    if (deltaOnly) {
+      os << "\"changedParam\":\"" << jsonEscape(changedParam) << "\",";
+    }
+    os << "\"params\":{";
+    os << "\"in_gamut\":" << raw.in_gamut << ",";
+    os << "\"in_oetf\":" << raw.in_oetf << ",";
+    os << "\"lookPreset\":" << raw.lookPreset << ",";
+    os << "\"tonescalePreset\":" << raw.tonescalePreset << ",";
+    os << "\"creativeWhitePreset\":" << raw.creativeWhitePreset << ",";
+    os << "\"displayEncodingPreset\":" << raw.displayEncodingPreset << ",";
+    os << "\"tn_Lp\":" << raw.tn_Lp << ",";
+    os << "\"tn_Lg\":" << raw.tn_Lg << ",";
+    os << "\"tn_gb\":" << raw.tn_gb << ",";
+    os << "\"pt_hdr\":" << raw.pt_hdr << ",";
+    os << "\"crv_enable\":" << raw.crv_enable << ",";
+    os << "\"clamp\":" << raw.clamp << ",";
+    os << "\"tn_su\":" << raw.tn_su << ",";
+    os << "\"display_gamut\":" << raw.display_gamut << ",";
+    os << "\"eotf\":" << raw.eotf << ",";
+    os << "\"lookPayload\":\"" << jsonEscape(lookPayload) << "\",";
+    os << "\"tonescalePayload\":\"" << jsonEscape(tonePayload) << "\"";
+    os << "}}";
+    return os.str();
+  }
+
+  // Update throttle gate for param snapshots/deltas to protect host responsiveness under rapid scrubbing.
+bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedParam, double time) {
+    if (!cubeViewerRequested_) return false;
+    if (!cubeViewerLive_ && !forceSnapshot) return false;
+    if (!cubeViewerWindowUsable_ && !forceSnapshot) return false;
+    const auto now = std::chrono::steady_clock::now();
+    if (!forceSnapshot) {
+      const auto sinceLast = std::chrono::duration_cast<std::chrono::milliseconds>(now - cubeViewerLastSendAt_);
+      if (sinceLast.count() < 20 && changedParam == cubeViewerLastParam_) return false;
+    }
+    cubeViewerLastSendAt_ = now;
+    cubeViewerLastParam_ = changedParam;
+    (void)time;
+    return true;
+  }
+
+  // Input-cloud gate: only emit when viewer is live/visible and source mode is input-image.
+bool shouldEmitCubeViewerInputCloud(double time) {
+    if (!cubeViewerRequested_ || !cubeViewerLive_) return false;
+    if (!cubeViewerWindowUsable_) return false;
+    if (getBool("cubeViewerIdentity", time, 1) != 0) return false;
+    const auto now = std::chrono::steady_clock::now();
+    if (cubeViewerLastCloudSendAt_ != std::chrono::steady_clock::time_point::min()) {
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - cubeViewerLastCloudSendAt_).count();
+      if (ms < 20) return false;
+    }
+    cubeViewerLastCloudSendAt_ = now;
+    return true;
+  }
+
+  // Input-cloud encoder: samples source/destination pairs into a compact point stream for viewer plotting.
+bool emitCubeViewerInputCloud(
+      const float* srcBase,
+      size_t srcRowBytes,
+      const float* dstBase,
+      size_t dstRowBytes,
+      int width,
+      int height) {
+    if (!srcBase || !dstBase || width <= 0 || height <= 0) return false;
+    if (srcRowBytes == 0 || dstRowBytes == 0) return false;
+
+    const size_t pxCount = static_cast<size_t>(width) * static_cast<size_t>(height);
+    size_t maxPts = 90000;
+    if (cubeViewerQuality_ <= 0) maxPts = 45000;
+    else if (cubeViewerQuality_ >= 2) maxPts = 180000;
+    const size_t targetPts = (maxPts < pxCount) ? maxPts : pxCount;
+    int yStep = 1;
+    if (targetPts < static_cast<size_t>(height) * 2u) {
+      yStep = static_cast<int>((static_cast<size_t>(height) + targetPts - 1u) / targetPts);
+      if (yStep < 1) yStep = 1;
+    }
+    size_t sampledRows = (static_cast<size_t>(height) + static_cast<size_t>(yStep) - 1u) / static_cast<size_t>(yStep);
+    if (sampledRows < 1u) sampledRows = 1u;
+    size_t targetPerRow = targetPts / sampledRows;
+    if (targetPerRow < 1u) targetPerRow = 1u;
+    int xStep = static_cast<int>((static_cast<size_t>(width) + targetPerRow - 1u) / targetPerRow);
+    if (xStep < 1) xStep = 1;
+
+    std::ostringstream pts;
+    pts.setf(std::ios::fixed);
+    pts.precision(4);
+    bool first = true;
+    auto clamp01 = [](float v) -> float {
+      return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    };
+    for (int y = 0; y < height; y += yStep) {
+      const char* srcRow = reinterpret_cast<const char*>(srcBase) + static_cast<size_t>(y) * srcRowBytes;
+      const char* dstRow = reinterpret_cast<const char*>(dstBase) + static_cast<size_t>(y) * dstRowBytes;
+      const float* s = reinterpret_cast<const float*>(srcRow);
+      const float* d = reinterpret_cast<const float*>(dstRow);
+      const int xStart = (xStep > 1)
+                             ? static_cast<int>((static_cast<uint32_t>(y) * 1664525u + 1013904223u) %
+                                                static_cast<uint32_t>(xStep))
+                             : 0;
+      for (int x = xStart; x < width; x += xStep) {
+        const size_t i = static_cast<size_t>(x) * 4u;
+        const float sr = s[i + 0];
+        const float sg = s[i + 1];
+        const float sb = s[i + 2];
+        const float dr = d[i + 0];
+        const float dg = d[i + 1];
+        const float db = d[i + 2];
+        if (!std::isfinite(sr) || !std::isfinite(sg) || !std::isfinite(sb) ||
+            !std::isfinite(dr) || !std::isfinite(dg) || !std::isfinite(db)) {
+          continue;
+        }
+        if (!first) pts << ' ';
+        first = false;
+        // Plot coordinates are clamped to cube bounds to avoid out-of-range spikes.
+        pts << clamp01(sr) << ' ' << clamp01(sg) << ' ' << clamp01(sb) << ' '
+            << clamp01(dr) << ' ' << clamp01(dg) << ' ' << clamp01(db);
+      }
+    }
+
+    std::ostringstream os;
+    os << "{";
+    os << "\"type\":\"input_cloud\",";
+    os << "\"seq\":" << cubeViewerSeq_++ << ",";
+    os << "\"senderId\":\"" << cubeViewerSenderId() << "\",";
+    os << "\"quality\":\"" << cubeViewerQualityName(cubeViewerQuality_) << "\",";
+    os << "\"resolution\":" << cubeViewerQualityToResolution(cubeViewerQuality_) << ",";
+    os << "\"sourceMode\":\"input\",";
+    os << "\"paramHash\":\"" << std::hash<std::string>{}(pts.str()) << "\",";
+    os << "\"points\":\"" << jsonEscape(pts.str()) << "\"";
+    os << "}";
+
+    if (sendCubeViewerMessage(os.str())) {
+      cubeViewerConnected_ = true;
+      setCubeViewerStatusLabel("Updating");
+      return true;
+    }
+    cubeViewerConnected_ = false;
+    setCubeViewerStatusLabel("Disconnected");
+    return false;
+  }
+
+  bool pushCubeViewerInputCloud(
+      double time,
+      const float* srcBase,
+      size_t srcRowBytes,
+      const float* dstBase,
+      size_t dstRowBytes,
+      int width,
+      int height) {
+    if (!shouldEmitCubeViewerInputCloud(time)) return false;
+    return emitCubeViewerInputCloud(srcBase, srcRowBytes, dstBase, dstRowBytes, width, height);
+  }
+
+  // Connection-facing publish step: send latest payload and update cached connection state.
+void pushCubeViewerUpdate(double time, const std::string& changedParam, bool forceSnapshot = false) {
+    if (!shouldEmitCubeViewerUpdate(forceSnapshot, changedParam, time)) return;
+    const std::string payload = buildCubeViewerParamsJson(time, !forceSnapshot, changedParam);
+    if (sendCubeViewerMessage(payload)) {
+      cubeViewerConnected_ = true;
+      setCubeViewerStatusLabel(forceSnapshot ? "Connected" : "Updating");
+    } else {
+      cubeViewerConnected_ = false;
+      setCubeViewerStatusLabel("Disconnected");
+    }
+  }
+
+  bool connectCubeViewerWithRetry(int attempts, int sleepMs) {
+    const std::string hello = "{\"type\":\"hello\",\"protocolVersion\":1,\"plugin\":\"ME_OpenDRT\"}";
+    for (int i = 0; i < attempts; ++i) {
+      if (sendCubeViewerMessage(hello)) return true;
+#if defined(_WIN32)
+      Sleep(static_cast<DWORD>(sleepMs));
+#else
+      std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+#endif
+    }
+    return false;
+  }
+
+  // Session open flow: attach to existing viewer if reachable, otherwise launch and handshake.
+void openCubeViewerSession(double time) {
+    cubeViewerRequested_ = true;
+    cubeViewerLive_ = getBool("cubeViewerLive", time, 1) != 0;
+    cubeViewerQuality_ = getChoice("cubeViewerQuality", time, 1);
+    cubeViewerLastHeartbeatAt_ = std::chrono::steady_clock::time_point::min();
+    cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+    cubeViewerWindowUsable_ = true;
+    setCubeViewerStatusLabel("Launching");
+    if (connectCubeViewerWithRetry(3, 40)) {
+      cubeViewerConnected_ = true;
+      cubeViewerWindowUsable_ = true;
+      setCubeViewerStatusLabel("Connected");
+      (void)sendCubeViewerMessage("{\"type\":\"open_session\"}");
+      (void)sendCubeViewerMessage("{\"type\":\"bring_to_front\"}");
+      pushCubeViewerUpdate(time, "openCubeViewer", true);
+      return;
+    }
+
+    std::string launchError;
+    std::string launchedPath;
+    uint32_t launchedPid = 0;
+    if (!launchCubeViewerProcessAsync(&launchError, &launchedPath, &launchedPid)) {
+      cubeViewerConnected_ = false;
+      cubeViewerWindowUsable_ = false;
+      setCubeViewerStatusLabel("Launch failed: viewer executable not found");
+      if (debugLogEnabled()) {
+        std::fprintf(stderr, "[ME_OpenDRT] Cube viewer launch failed: %s\n", launchError.c_str());
+      }
+      return;
+    }
+    cubeViewerProcessId_ = launchedPid;
+    if (debugLogEnabled()) {
+      std::fprintf(stderr, "[ME_OpenDRT] Cube viewer launched from: %s\n", launchedPath.c_str());
+    }
+    if (connectCubeViewerWithRetry(18, 40)) {
+      cubeViewerConnected_ = true;
+      cubeViewerWindowUsable_ = true;
+      setCubeViewerStatusLabel("Connected");
+      const std::string openMsg = "{\"type\":\"open_session\"}";
+      (void)sendCubeViewerMessage(openMsg);
+      (void)sendCubeViewerMessage("{\"type\":\"bring_to_front\"}");
+      pushCubeViewerUpdate(time, "openCubeViewer", true);
+      return;
+    }
+    cubeViewerConnected_ = false;
+    cubeViewerWindowUsable_ = false;
+    setCubeViewerStatusLabel("Launched (awaiting connection)");
+  }
+
+  // Session close flow: local disconnect only (viewer process remains independent by design).
+void closeCubeViewerSession() {
+    if (!cubeViewerRequested_ && !cubeViewerConnected_ && cubeViewerProcessId_ == 0) {
+      return;
+    }
+    // Local disconnect only: keep external viewer process alive.
+    // Open action can re-attach to an existing viewer instance.
+    cubeViewerRequested_ = false;
+    cubeViewerConnected_ = false;
+    cubeViewerProcessId_ = 0;
+    cubeViewerWindowUsable_ = false;
+    cubeViewerLastHeartbeatAt_ = std::chrono::steady_clock::time_point::min();
+    cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+    setCubeViewerStatusLabel("Disconnected");
   }
 
   OpenDRTRawValues readRawValues(double time) const {
@@ -3423,6 +4154,20 @@ class OpenDRTEffect : public OFX::ImageEffect {
   int menuLabelToneIdx_ = -1;
   bool menuLabelLookModified_ = false;
   bool menuLabelToneModified_ = false;
+  bool cubeViewerRequested_ = false;
+  bool cubeViewerConnected_ = false;
+  uint32_t cubeViewerProcessId_ = 0;
+  bool cubeViewerLive_ = true;
+  bool cubeViewerWindowUsable_ = false;
+  int cubeViewerQuality_ = 1;
+  uint64_t cubeViewerSeq_ = 1;
+  std::string cubeViewerStatusCache_ = "Disconnected";
+  bool allowUiParamWrites_ = true;
+  std::string cubeViewerLastParam_;
+  std::chrono::steady_clock::time_point cubeViewerLastSendAt_ = std::chrono::steady_clock::time_point::min();
+  std::chrono::steady_clock::time_point cubeViewerLastHeartbeatAt_ = std::chrono::steady_clock::time_point::min();
+  std::chrono::steady_clock::time_point cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+  std::string cubeViewerSenderId_;
 };
 
 class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
@@ -3463,7 +4208,8 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
 
   // ===== Parameter + UI Layout =====
   // Defines all OFX params, groups, pages, and parent/child wiring.
-  void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override {
+  // Descriptor build pipeline: define pages/groups first, then params, then parent-child wiring/order.
+void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override {
     OFX::ClipDescriptor* src = d.defineClip(kOfxImageEffectSimpleSourceClipName);
     src->addSupportedComponent(OFX::ePixelComponentRGBA);
     src->setTemporalClipAccess(false);
@@ -3473,10 +4219,12 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     dst->addSupportedComponent(OFX::ePixelComponentRGBA);
     dst->setSupportsTiles(false);
 
-    auto* pLook = d.definePageParam("Look");
-    auto* pOverlay = d.definePageParam("Overlay");
-    auto* pAdvanced = d.definePageParam("Advanced Look Control");
     auto* pUserPresets = d.definePageParam("User Preset Manager");
+    auto* pBasic = d.definePageParam("Basic");
+    auto* pAdvanced = d.definePageParam("Advanced Look Control");
+    auto* pCubeViewer = d.definePageParam("Cube Viewer");
+    auto* pSupport = d.definePageParam("Support");
+    pSupport->setLabel("Support");
     auto* grpUserPresetsRoot = d.defineGroupParam("grp_user_presets_root");
     grpUserPresetsRoot->setLabel("User Preset Manager");
     grpUserPresetsRoot->setOpen(false);
@@ -3541,13 +4289,28 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     discardPresetChanges->setLabel("Discard Changes");
     discardPresetChanges->setEnabled(false);
     discardPresetChanges->setParent(*grpLookBasic);
-    pLook->addChild(*grpLookBasic); pLook->addChild(*inGamut); pLook->addChild(*inOetf); pLook->addChild(*dep); pLook->addChild(*lookPreset); pLook->addChild(*presetState); pLook->addChild(*cwpHidden); pLook->addChild(*activeUserLookSlot); pLook->addChild(*activeUserToneSlot); pLook->addChild(*tonescalePreset); pLook->addChild(*cwpPreset); pLook->addChild(*cwpLm); pLook->addChild(*baseWpLabel); pLook->addChild(*surroundLabel); pLook->addChild(*discardPresetChanges);
+    pBasic->addChild(*grpLookBasic);
+    pBasic->addChild(*inGamut);
+    pBasic->addChild(*inOetf);
+    pBasic->addChild(*dep);
+    pBasic->addChild(*lookPreset);
+    pBasic->addChild(*presetState);
+    pBasic->addChild(*cwpHidden);
+    pBasic->addChild(*activeUserLookSlot);
+    pBasic->addChild(*activeUserToneSlot);
+    pBasic->addChild(*tonescalePreset);
+    pBasic->addChild(*cwpPreset);
+    pBasic->addChild(*cwpLm);
+    pBasic->addChild(*baseWpLabel);
+    pBasic->addChild(*surroundLabel);
+    pBasic->addChild(*discardPresetChanges);
 
     auto* overlay = d.defineBooleanParam("crv_enable");
     overlay->setLabel("Tonescale Overlay");
     overlay->setDefault(false);
     if (const char* hint = tooltipForParam("crv_enable")) overlay->setHint(hint);
-    pOverlay->addChild(*overlay);
+    overlay->setParent(*grpLookBasic);
+    pBasic->addChild(*overlay);
 
     auto* grpAdvancedRoot = d.defineGroupParam("grp_advanced_root"); grpAdvancedRoot->setLabel("Advanced Look Control"); grpAdvancedRoot->setOpen(false);
     auto* grpDisplayMapping = d.defineGroupParam("grp_display_mapping"); grpDisplayMapping->setLabel("Display Mapping"); grpDisplayMapping->setOpen(false); grpDisplayMapping->setParent(*grpAdvancedRoot);
@@ -3716,8 +4479,65 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     userPresetRefresh->setParent(*grpUserPresetsRoot);
     pUserPresets->addChild(*userPresetRefresh);
 
-    auto* pSupport = d.definePageParam("Support");
-    pSupport->setLabel("Support");
+    auto* grpCubeViewer = d.defineGroupParam("grp_cube_viewer");
+    grpCubeViewer->setLabel("Cube Viewer");
+    grpCubeViewer->setOpen(false);
+    pCubeViewer->addChild(*grpCubeViewer);
+
+    auto* closeCubeViewer = d.definePushButtonParam("closeCubeViewer");
+    closeCubeViewer->setLabel("Disconnect Viewer");
+    closeCubeViewer->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipForParam("closeCubeViewer")) closeCubeViewer->setHint(hint);
+    pCubeViewer->addChild(*closeCubeViewer);
+
+    auto* cubeViewerLive = d.defineBooleanParam("cubeViewerLive");
+    cubeViewerLive->setLabel("Live Update Viewer");
+    cubeViewerLive->setDefault(true);
+    cubeViewerLive->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipForParam("cubeViewerLive")) cubeViewerLive->setHint(hint);
+    pCubeViewer->addChild(*cubeViewerLive);
+
+    auto* cubeViewerSource = d.defineChoiceParam("cubeViewerSource");
+    cubeViewerSource->appendOption("Identity Cube");
+    cubeViewerSource->appendOption("Input Image");
+    cubeViewerSource->setDefault(0);
+    cubeViewerSource->setIsSecret(true);
+
+    auto* cubeViewerOnTop = d.defineBooleanParam("cubeViewerOnTop");
+    cubeViewerOnTop->setLabel("Keep Viewer On Top");
+    cubeViewerOnTop->setDefault(true);
+    cubeViewerOnTop->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipForParam("cubeViewerOnTop")) cubeViewerOnTop->setHint(hint);
+    pCubeViewer->addChild(*cubeViewerOnTop);
+
+    auto* cubeViewerQuality = d.defineChoiceParam("cubeViewerQuality");
+    cubeViewerQuality->setLabel("Viewer Quality");
+    cubeViewerQuality->appendOption("Low");
+    cubeViewerQuality->appendOption("Medium");
+    cubeViewerQuality->appendOption("High");
+    cubeViewerQuality->setDefault(1);
+    cubeViewerQuality->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipForParam("cubeViewerQuality")) cubeViewerQuality->setHint(hint);
+    pCubeViewer->addChild(*cubeViewerQuality);
+
+    auto* cubeViewerStatus = d.defineStringParam("cubeViewerStatus");
+    cubeViewerStatus->setLabel("Viewer Status");
+    cubeViewerStatus->setDefault("Disconnected");
+    cubeViewerStatus->setEnabled(false);
+    cubeViewerStatus->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipForParam("cubeViewerStatus")) cubeViewerStatus->setHint(hint);
+    pCubeViewer->addChild(*cubeViewerStatus);
+
+    // Quick controls: standalone (no group/tab parent), kept in this declaration order.
+    auto* openCubeViewer = d.definePushButtonParam("openCubeViewer");
+    openCubeViewer->setLabel("Open 3D Cube Viewer");
+    if (const char* hint = tooltipForParam("openCubeViewer")) openCubeViewer->setHint(hint);
+
+    auto* cubeViewerIdentity = d.defineBooleanParam("cubeViewerIdentity");
+    cubeViewerIdentity->setLabel("Identity Cube");
+    cubeViewerIdentity->setDefault(true);
+    if (const char* hint = tooltipForParam("cubeViewerIdentity")) cubeViewerIdentity->setHint(hint);
+
     auto* grpSupportRoot = d.defineGroupParam("grp_support_root");
     grpSupportRoot->setLabel("Support");
     grpSupportRoot->setOpen(false);
@@ -3765,6 +4585,7 @@ void OFX::Plugin::getPluginIDs(OFX::PluginFactoryArray& ids) {
   static OpenDRTFactory p;
   ids.push_back(&p);
 }
+
 
 
 

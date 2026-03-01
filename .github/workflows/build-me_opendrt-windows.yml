@@ -1,4 +1,4 @@
-name: Build ME_OpenDRT Windows (x86_64 CUDA/OpenCL/CPU)
+﻿name: Build ME_OpenDRT Windows (x86_64 CUDA/OpenCL/CPU)
 
 on:
   workflow_dispatch:
@@ -65,7 +65,7 @@ jobs:
         run: choco install ninja --no-progress -y
 
       - name: Configure
-        run: cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DME_OPENDRT_BUILD_CUBE_VIEWER_STUB=ON
 
       - name: Build
         run: cmake --build build-win --config Release
@@ -74,6 +74,9 @@ jobs:
         run: |
           if (!(Test-Path "bundle/ME_OpenDRT.ofx.bundle/Contents/Win64/ME_OpenDRT.ofx")) {
             throw "Missing Windows plugin binary"
+          }
+          if (!(Test-Path "bundle/ME_OpenDRT.ofx.bundle/Contents/Win64/ME_OpenDRT_CubeViewer.exe")) {
+            throw "Missing Windows cube viewer binary"
           }
 
       - name: Package Windows portable bundle
@@ -86,3 +89,7 @@ jobs:
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: ${{ env.ZIP_NAME }}
+
+
+
+

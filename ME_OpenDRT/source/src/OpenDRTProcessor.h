@@ -13,12 +13,13 @@
 #include <vector>
 
 #include "OpenDRTParams.h"
+#include "OpenDRTCPUCore.h"
 
-#if defined(OFX_SUPPORTS_CUDARENDER)
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(ME_OPENDRT_VIEWER_CPU_ONLY)
 #define ME_OPENDRT_HAS_CUDA 1
 #endif
 
-#if defined(_WIN32) || defined(__linux__)
+#if (defined(_WIN32) || defined(__linux__)) && !defined(ME_OPENDRT_VIEWER_CPU_ONLY)
 #define ME_OPENDRT_HAS_OPENCL 1
 #endif
 
@@ -55,7 +56,7 @@ extern "C" void launchOpenDRTKernelPitched(
     cudaStream_t stream);
 #endif
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !defined(ME_OPENDRT_VIEWER_CPU_ONLY)
 #include "metal/OpenDRTMetal.h"
 #endif
 
@@ -95,7 +96,7 @@ class OpenDRTProcessor {
     // Backend dispatch policy:
     // - macOS: Metal first, then CPU fallback.
     // - CUDA builds (Windows/Linux): CUDA first (unless forced OpenCL), then OpenCL, then CPU fallback.
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !defined(ME_OPENDRT_VIEWER_CPU_ONLY)
     if (renderMetal(src, dst, width, height, srcRowBytes, dstRowBytes)) {
       return true;
     }
@@ -513,9 +514,10 @@ class OpenDRTProcessor {
   }
 
   bool renderCPU(const float* src, float* dst, int width, int height) {
-    // Safety fallback used when no GPU path is available.
-    const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u * sizeof(float);
-    std::memcpy(dst, src, bytes);
+    // CPU fallback now runs the same resolved transform model used by the GPU paths.
+    // This preserves viewer usefulness in ME_OPENDRT_VIEWER_CPU_ONLY mode and makes
+    // plugin CPU fallback visually meaningful instead of pass-through.
+    OpenDRTCPU::transformBuffer(src, dst, width, height, params_, derived_);
     return true;
   }
 
@@ -644,8 +646,13 @@ class OpenDRTProcessor {
     // Safe to remove when rollout completes and fallback is retired.
 #if defined(_WIN32)
     HMODULE self = nullptr;
+#if defined(ME_OPENDRT_HAS_CUDA)
+    const auto moduleSymbol = reinterpret_cast<LPCSTR>(&launchOpenDRTKernel);
+#else
+    const auto moduleSymbol = reinterpret_cast<LPCSTR>(&OpenDRTProcessor::moduleAnchor);
+#endif
     if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            reinterpret_cast<LPCSTR>(&launchOpenDRTKernel), &self)) {
+                            moduleSymbol, &self)) {
       return std::string();
     }
     char modulePath[MAX_PATH] = {0};
@@ -765,6 +772,8 @@ class OpenDRTProcessor {
     }
     return true;
   }
+
+  static void moduleAnchor() {}
 
   bool ensureOpenCLBuffers(size_t bytes) {
     if (clSrc_ != nullptr && clDst_ != nullptr && clParams_ != nullptr && clDerived_ != nullptr && clBytes_ == bytes) {
