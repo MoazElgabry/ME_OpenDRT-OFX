@@ -1,4 +1,4 @@
-﻿name: Build ME_OpenDRT Windows (x86_64 CUDA/OpenCL/CPU)
+name: Build ME_OpenDRT Windows (x86_64 CUDA/OpenCL/CPU)
 
 on:
   workflow_dispatch:
@@ -9,9 +9,9 @@ on:
 jobs:
   build-windows:
     env:
-      OPENDRT_VERSION: v1.1.0-rc1
-      ZIP_NAME: ME_OpenDRT_v1.1.0-rc1_windows_x86_64_portable.zip
-      ARTIFACT_NAME: ME_OpenDRT-v1.1.0-rc1-windows-x86_64
+      OPENDRT_VERSION: v1.2.0
+      ZIP_NAME: ME_OpenDRT_v1.2.0_windows_x86_64_portable.zip
+      ARTIFACT_NAME: ME_OpenDRT-v1.2.0-windows-x86_64
 
     runs-on: windows-2022
 

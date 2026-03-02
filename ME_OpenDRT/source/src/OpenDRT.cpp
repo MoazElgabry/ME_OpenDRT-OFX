@@ -4568,7 +4568,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
     supportOfxVersion->setLabel("OFX version");
-    supportOfxVersion->setDefault("v1.1.0-rc1");
+    supportOfxVersion->setDefault("v1.2.0");
     supportOfxVersion->setEnabled(false);
     supportOfxVersion->setParent(*grpSupportRoot);
     pSupport->addChild(*supportOfxVersion);
