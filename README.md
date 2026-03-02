@@ -6,7 +6,7 @@ and design the DRT aspects according to their projects and stories. I've built a
 that makes it easy to store and share configurations to give the colorist both flexibility and speed. 
 
 Current plugin in this repo:
-- **ME_OpenDRT OFX v1.1-rc1** (A direct port from OpenDRT v1.1.0)
+- **ME_OpenDRT OFX v1.2** (A direct port from OpenDRT v1.1.0)
 
 ## Upstream Project and License
 This project is based on OpenDRT and is distributed under **GNU GPL v3**.
@@ -20,7 +20,6 @@ This project is based on OpenDRT and is distributed under **GNU GPL v3**.
 
 ## Installation
 
-## Installation
 1. Download the latest portable build for your platform from the latest release or [here](https://github.com/MoazElgabry/ME_OFX/tree/main/ME_OpenDRT).
 2. Copy `ME_OpenDRT.ofx.bundle` to your OFX plugin directory:
    - Windows: `C:\Program Files\Common Files\OFX\Plugins\`
