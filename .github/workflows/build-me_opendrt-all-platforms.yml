@@ -93,7 +93,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++ ocl-icd-opencl-dev libglfw3-dev libgl1-mesa-dev
+          sudo apt-get install -y cmake ninja-build g++ ocl-icd-opencl-dev libglfw3-dev libgl1-mesa-dev xvfb
           if [ "${{ matrix.variant.linux_cuda }}" = "ON" ]; then
             sudo apt-get install -y nvidia-cuda-toolkit
           fi
@@ -112,6 +112,25 @@ jobs:
         run: |
           test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Linux-x86-64/ME_OpenDRT.ofx
           test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Linux-x86-64/ME_OpenDRT_CubeViewer
+          chmod +x bundle/ME_OpenDRT.ofx.bundle/Contents/Linux-x86-64/ME_OpenDRT_CubeViewer
+
+      - name: Verify Linux viewer runtime deps and launch
+        run: |
+          viewer="bundle/ME_OpenDRT.ofx.bundle/Contents/Linux-x86-64/ME_OpenDRT_CubeViewer"
+          ldd "$viewer" | tee /tmp/me_opendrt_viewer_ldd.txt
+          if grep -q "not found" /tmp/me_opendrt_viewer_ldd.txt; then
+            echo "Unresolved shared libraries in Cube Viewer"
+            exit 1
+          fi
+          set +e
+          timeout 5s xvfb-run -a "$viewer" >/tmp/me_opendrt_viewer_run.log 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -ne 124 ]; then
+            echo "Cube Viewer exited early (rc=$rc); expected timeout(124) if launch is healthy."
+            cat /tmp/me_opendrt_viewer_run.log
+            exit 1
+          fi
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4

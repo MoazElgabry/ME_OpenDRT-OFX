@@ -276,6 +276,12 @@ if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
       COMMAND /bin/chmod +x "$<TARGET_FILE:ME_OpenDRT_CubeViewer>"
       VERBATIM
     )
+  elseif(UNIX)
+    # Linux bundles also need the execute bit preserved for direct launch.
+    add_custom_command(TARGET ME_OpenDRT_CubeViewer POST_BUILD
+      COMMAND /bin/chmod +x "$<TARGET_FILE:ME_OpenDRT_CubeViewer>"
+      VERBATIM
+    )
   endif()
 endif()
 
