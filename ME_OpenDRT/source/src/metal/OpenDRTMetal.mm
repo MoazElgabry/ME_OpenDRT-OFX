@@ -3,6 +3,7 @@
 
 #include <dlfcn.h>
 #include <cstddef>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -35,6 +36,8 @@ struct ThreadBuffers {
   id<MTLBuffer> srcBuffer = nil;
   id<MTLBuffer> dstBuffer = nil;
   size_t bufferBytes = 0;
+  id<MTLBuffer> hostTempDstBuffer = nil;
+  size_t hostTempDstBytes = 0;
 };
 
 MetalContext& context() {
@@ -80,6 +83,45 @@ bool forceHostMetalWait() {
 
 bool disableMetal2DCopy() {
   static const bool enabled = envFlagEnabled("ME_OPENDRT_DISABLE_METAL_2D_COPY");
+  return enabled;
+}
+
+enum class HostOffsetMode {
+  Auto,
+  Zero,
+  Origin,
+  FallbackAmbiguous
+};
+
+HostOffsetMode hostOffsetMode() {
+  static const HostOffsetMode mode = []() {
+    const char* v = std::getenv("ME_OPENDRT_HOST_METAL_OFFSET_MODE");
+    if (v != nullptr && v[0] != '\0') {
+      std::string s(v);
+      for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      if (s == "ZERO") return HostOffsetMode::Zero;
+      if (s == "ORIGIN") return HostOffsetMode::Origin;
+      if (s == "FALLBACK" || s == "SAFE") return HostOffsetMode::FallbackAmbiguous;
+    }
+    return HostOffsetMode::Auto;
+  }();
+  return mode;
+}
+
+bool useHostIntermediateDst() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("ME_OPENDRT_HOST_METAL_INTERMEDIATE_DST");
+    if (v != nullptr && v[0] != '\0') {
+      return !(v[0] == '0' && v[1] == '\0');
+    }
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    // On Apple Silicon host-Metal, writing to a temp buffer then blitting to host dst
+    // reduces visible partial-write artifacts without forcing full command completion waits.
+    return true;
+#else
+    return false;
+#endif
+  }();
   return enabled;
 }
 
@@ -395,24 +437,91 @@ bool renderHost(
   const size_t requiredDstBytes = dstRowBytes * static_cast<size_t>(height);
   const size_t pixelBytes = 4u * sizeof(float);
   const bool originValid = (originX >= 0 && originY >= 0);
+  const bool hasOriginOffset = originValid && (originX > 0 || originY > 0);
   size_t srcOffsetBytes = 0;
   size_t dstOffsetBytes = 0;
-  if (originValid && (originX > 0 || originY > 0)) {
+  size_t srcCandidateOffset = 0;
+  size_t dstCandidateOffset = 0;
+  bool canUseOffset = false;
+  const bool canUseZero = (srcBuffer.length >= requiredSrcBytes && dstBuffer.length >= requiredDstBytes);
+  if (hasOriginOffset) {
     const size_t ox = static_cast<size_t>(originX);
     const size_t oy = static_cast<size_t>(originY);
-    const size_t srcCandidateOffset = oy * srcRowBytes + ox * pixelBytes;
-    const size_t dstCandidateOffset = oy * dstRowBytes + ox * pixelBytes;
-    // Host implementations differ: some provide a full-frame MTLBuffer, others a tile-local one.
-    // Use the offset only when it clearly fits in the source and destination allocations.
-    if (srcBuffer.length >= srcCandidateOffset + requiredSrcBytes &&
-        dstBuffer.length >= dstCandidateOffset + requiredDstBytes) {
+    srcCandidateOffset = oy * srcRowBytes + ox * pixelBytes;
+    dstCandidateOffset = oy * dstRowBytes + ox * pixelBytes;
+    canUseOffset =
+        (srcBuffer.length >= srcCandidateOffset + requiredSrcBytes && dstBuffer.length >= dstCandidateOffset + requiredDstBytes);
+  }
+
+  const bool ambiguousOffset = hasOriginOffset && canUseZero && canUseOffset;
+  const HostOffsetMode offsetMode = hostOffsetMode();
+  switch (offsetMode) {
+    case HostOffsetMode::Zero:
+      if (!canUseZero) return false;
+      break;
+    case HostOffsetMode::Origin:
+      if (!canUseOffset) return false;
       srcOffsetBytes = srcCandidateOffset;
       dstOffsetBytes = dstCandidateOffset;
-    }
+      break;
+    case HostOffsetMode::FallbackAmbiguous:
+      if (ambiguousOffset) {
+        if (debugLogEnabled()) {
+          std::fprintf(
+              stderr,
+              "[ME_OpenDRT][Metal] Host offset ambiguous (origin=%d,%d rowBytes=%zu/%zu len=%zu/%zu). Falling back.\n",
+              originX,
+              originY,
+              srcRowBytes,
+              dstRowBytes,
+              static_cast<size_t>(srcBuffer.length),
+              static_cast<size_t>(dstBuffer.length));
+        }
+        return false;
+      }
+      if (canUseOffset) {
+        srcOffsetBytes = srcCandidateOffset;
+        dstOffsetBytes = dstCandidateOffset;
+      } else if (!canUseZero) {
+        return false;
+      }
+      break;
+    case HostOffsetMode::Auto:
+    default:
+      if (canUseOffset && (!canUseZero || hasOriginOffset)) {
+        srcOffsetBytes = srcCandidateOffset;
+        dstOffsetBytes = dstCandidateOffset;
+      } else if (!canUseZero) {
+        return false;
+      }
+      if (ambiguousOffset && debugLogEnabled()) {
+        std::fprintf(
+            stderr,
+            "[ME_OpenDRT][Metal] Host offset ambiguous -> AUTO chose ORIGIN (origin=%d,%d).\n",
+            originX,
+            originY);
+      }
+      break;
   }
 
   if (srcBuffer.length < srcOffsetBytes + requiredSrcBytes || dstBuffer.length < dstOffsetBytes + requiredDstBytes) {
     return false;
+  }
+
+  id<MTLBuffer> kernelDstBuffer = dstBuffer;
+  size_t kernelDstOffset = dstOffsetBytes;
+  if (!forceHostMetalWait() && useHostIntermediateDst()) {
+    auto& buffers = threadBuffers();
+    if (buffers.hostTempDstBuffer == nil || buffers.hostTempDstBytes < requiredDstBytes) {
+      buffers.hostTempDstBuffer = [ctx.device newBufferWithLength:requiredDstBytes options:MTLResourceStorageModeShared];
+      buffers.hostTempDstBytes = (buffers.hostTempDstBuffer != nil) ? requiredDstBytes : 0;
+    }
+    if (buffers.hostTempDstBuffer == nil) {
+      debugLog("Failed to allocate host temp dst buffer.");
+      return false;
+    }
+    kernelDstBuffer = buffers.hostTempDstBuffer;
+    kernelDstOffset = 0;
   }
 
   const int srcRowFloats = static_cast<int>(srcRowBytes / sizeof(float));
@@ -431,7 +540,7 @@ bool renderHost(
 
   [enc setComputePipelineState:ctx.pipeline];
   [enc setBuffer:srcBuffer offset:srcOffsetBytes atIndex:0];
-  [enc setBuffer:dstBuffer offset:dstOffsetBytes atIndex:1];
+  [enc setBuffer:kernelDstBuffer offset:kernelDstOffset atIndex:1];
   [enc setBytes:&params length:sizeof(OpenDRTParams) atIndex:2];
   [enc setBytes:&width length:sizeof(int) atIndex:3];
   [enc setBytes:&height length:sizeof(int) atIndex:4];
@@ -450,6 +559,19 @@ bool renderHost(
   const MTLSize threadsPerGrid = MTLSizeMake(static_cast<NSUInteger>(width), static_cast<NSUInteger>(height), 1);
   [enc dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
   [enc endEncoding];
+  if (kernelDstBuffer != dstBuffer) {
+    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+    if (blit == nil) {
+      debugLog("Failed to create host Metal blit encoder.");
+      return false;
+    }
+    [blit copyFromBuffer:kernelDstBuffer
+            sourceOffset:0
+                toBuffer:dstBuffer
+       destinationOffset:dstOffsetBytes
+                    size:requiredDstBytes];
+    [blit endEncoding];
+  }
   if (!forceHostMetalWait()) {
     [cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
       if (cb.status != MTLCommandBufferStatusCompleted) {

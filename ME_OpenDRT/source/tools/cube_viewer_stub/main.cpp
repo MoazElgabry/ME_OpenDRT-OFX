@@ -38,6 +38,9 @@ namespace {
 std::atomic<bool> gRun{true};
 std::atomic<bool> gConnected{false};
 std::atomic<bool> gBringToFront{false};
+std::atomic<int> gWindowVisible{1};
+std::atomic<int> gWindowIconified{0};
+std::atomic<int> gWindowFocused{1};
 
 void onSignal(int) {
   gRun.store(false);
@@ -328,30 +331,41 @@ bool parseInputCloudMessage(const std::string& msg, InputCloudPayload* out) {
   return true;
 }
 
-void queueLineForMainThread(const std::string& line) {
-  if (line.empty()) return;
+std::string heartbeatAckJson() {
+  const int visible = gWindowVisible.load(std::memory_order_relaxed) ? 1 : 0;
+  const int minimized = gWindowIconified.load(std::memory_order_relaxed) ? 1 : 0;
+  const int focused = gWindowFocused.load(std::memory_order_relaxed) ? 1 : 0;
+  const int active = (visible != 0 && minimized == 0) ? 1 : 0;
+  std::ostringstream os;
+  os << "{\"type\":\"heartbeat_ack\",\"active\":" << active << ",\"visible\":" << visible
+     << ",\"minimized\":" << minimized << ",\"focused\":" << focused << "}";
+  return os.str();
+}
+
+std::string handleIncomingLine(const std::string& line) {
+  if (line.empty()) return std::string();
   if (line.find("\"type\":\"hello\"") != std::string::npos || line.find("\"type\":\"open_session\"") != std::string::npos) {
     gConnected.store(true);
-    return;
+    return std::string();
   }
   if (line.find("\"type\":\"close_session\"") != std::string::npos) {
     gRun.store(false);
-    return;
+    return std::string();
   }
   if (line.find("\"type\":\"heartbeat\"") != std::string::npos) {
     gConnected.store(true);
-    return;
+    return heartbeatAckJson();
   }
   if (line.find("\"type\":\"bring_to_front\"") != std::string::npos) {
     gBringToFront.store(true);
     gConnected.store(true);
-    return;
+    return std::string();
   }
   ResolvedPayload payload{};
   InputCloudPayload cloud{};
   const bool isParams = parseParamsMessage(line, &payload);
   const bool isCloud = isParams ? false : parseInputCloudMessage(line, &cloud);
-  if (!isParams && !isCloud) return;
+  if (!isParams && !isCloud) return std::string();
   std::lock_guard<std::mutex> lock(gMsgMutex);
   if (isParams) {
     gPendingParamsMsg.seq = payload.seq;
@@ -363,6 +377,7 @@ void queueLineForMainThread(const std::string& line) {
     gHasPendingCloudMsg = true;
   }
   gConnected.store(true);
+  return std::string();
 }
 
 OpenDRTParams buildResolvedParams(const ResolvedPayload& rp) {
@@ -579,7 +594,7 @@ void ipcServerLoop() {
   while (gRun.load()) {
     HANDLE hPipe = CreateNamedPipeA(
         name.c_str(),
-        PIPE_ACCESS_INBOUND,
+        PIPE_ACCESS_DUPLEX,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
         1,
         0,
@@ -604,7 +619,13 @@ void ipcServerLoop() {
       while ((nl = pending.find('\n')) != std::string::npos) {
         std::string line = pending.substr(0, nl);
         if (!line.empty() && line.back() == '\r') line.pop_back();
-        queueLineForMainThread(line);
+        const std::string response = handleIncomingLine(line);
+        if (!response.empty()) {
+          std::string payload = response;
+          payload.push_back('\n');
+          DWORD written = 0;
+          (void)WriteFile(hPipe, payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr);
+        }
         pending.erase(0, nl + 1);
       }
     }
@@ -670,7 +691,12 @@ void ipcServerLoop() {
       while ((nl = pending.find('\n')) != std::string::npos) {
         std::string line = pending.substr(0, nl);
         if (!line.empty() && line.back() == '\r') line.pop_back();
-        queueLineForMainThread(line);
+        const std::string response = handleIncomingLine(line);
+        if (!response.empty()) {
+          std::string payload = response;
+          payload.push_back('\n');
+          (void)::send(client, payload.data(), payload.size(), 0);
+        }
         pending.erase(0, nl + 1);
       }
     }
@@ -861,6 +887,9 @@ int runApp() {
 
   while (gRun.load() && !glfwWindowShouldClose(window)) {
     glfwPollEvents();
+    gWindowVisible.store(glfwGetWindowAttrib(window, GLFW_VISIBLE) == GLFW_TRUE ? 1 : 0, std::memory_order_relaxed);
+    gWindowIconified.store(glfwGetWindowAttrib(window, GLFW_ICONIFIED) == GLFW_TRUE ? 1 : 0, std::memory_order_relaxed);
+    gWindowFocused.store(glfwGetWindowAttrib(window, GLFW_FOCUSED) == GLFW_TRUE ? 1 : 0, std::memory_order_relaxed);
     processMouseAndKeys(window, &app);
 
     PendingMessage pendingParams{};

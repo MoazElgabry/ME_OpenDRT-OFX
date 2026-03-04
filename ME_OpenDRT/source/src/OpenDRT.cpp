@@ -424,6 +424,118 @@ bool sendCubeViewerMessage(const std::string& msg) {
 #endif
 }
 
+int extractJsonIntField(const std::string& json, const char* key, int fallback) {
+  if (!key || key[0] == '\0') return fallback;
+  const std::string needle = std::string("\"") + key + "\":";
+  const size_t pos = json.find(needle);
+  if (pos == std::string::npos) return fallback;
+  size_t i = pos + needle.size();
+  while (i < json.size() && std::isspace(static_cast<unsigned char>(json[i]))) ++i;
+  bool neg = false;
+  if (i < json.size() && (json[i] == '-' || json[i] == '+')) {
+    neg = (json[i] == '-');
+    ++i;
+  }
+  long long value = 0;
+  bool any = false;
+  while (i < json.size() && std::isdigit(static_cast<unsigned char>(json[i]))) {
+    any = true;
+    value = value * 10 + static_cast<long long>(json[i] - '0');
+    ++i;
+  }
+  if (!any) return fallback;
+  if (neg) value = -value;
+  return static_cast<int>(value);
+}
+
+bool sendCubeViewerHeartbeatProbe(
+    int* activeOut,
+    int* visibleOut,
+    int* minimizedOut,
+    int* focusedOut,
+    int timeoutMs = 80) {
+  const std::string payload = "{\"type\":\"heartbeat\"}\n";
+#if defined(_WIN32)
+  HANDLE h = CreateFileA(
+      cubeViewerPipeName().c_str(),
+      GENERIC_READ | GENERIC_WRITE,
+      0,
+      nullptr,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  DWORD written = 0;
+  const BOOL writeOk = WriteFile(h, payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr);
+  if (writeOk != TRUE || written != payload.size()) {
+    CloseHandle(h);
+    return false;
+  }
+
+  std::string response;
+  const DWORD kTimeoutMs = timeoutMs > 0 ? static_cast<DWORD>(timeoutMs) : 1u;
+  const DWORD t0 = GetTickCount();
+  while ((GetTickCount() - t0) < kTimeoutMs) {
+    DWORD avail = 0;
+    if (PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr) != TRUE) break;
+    if (avail > 0) {
+      char buf[512];
+      DWORD got = 0;
+      if (ReadFile(h, buf, static_cast<DWORD>(sizeof(buf) - 1), &got, nullptr) == TRUE && got > 0) {
+        response.assign(buf, buf + got);
+      }
+      break;
+    }
+    Sleep(2);
+  }
+  CloseHandle(h);
+#else
+  int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) return false;
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  const std::string path = cubeViewerPipeName();
+  if (path.size() >= sizeof(addr.sun_path)) {
+    ::close(fd);
+    return false;
+  }
+  std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+  if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    ::close(fd);
+    return false;
+  }
+  const ssize_t sent = ::send(fd, payload.data(), payload.size(), 0);
+  if (sent != static_cast<ssize_t>(payload.size())) {
+    ::close(fd);
+    return false;
+  }
+  timeval tv{};
+  if (timeoutMs < 1) timeoutMs = 1;
+  tv.tv_sec = timeoutMs / 1000;
+  tv.tv_usec = static_cast<suseconds_t>((timeoutMs % 1000) * 1000);
+  (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+  char buf[512];
+  const ssize_t n = ::recv(fd, buf, sizeof(buf) - 1, 0);
+  std::string response;
+  if (n > 0) response.assign(buf, buf + n);
+  ::close(fd);
+#endif
+
+  if (response.empty()) {
+    if (activeOut) *activeOut = 1;
+    if (visibleOut) *visibleOut = 1;
+    if (minimizedOut) *minimizedOut = 0;
+    if (focusedOut) *focusedOut = 1;
+    return true;
+  }
+
+  if (activeOut) *activeOut = extractJsonIntField(response, "active", 1);
+  if (visibleOut) *visibleOut = extractJsonIntField(response, "visible", 1);
+  if (minimizedOut) *minimizedOut = extractJsonIntField(response, "minimized", 0);
+  if (focusedOut) *focusedOut = extractJsonIntField(response, "focused", 1);
+  return true;
+}
+
 constexpr int kBuiltInLookPresetCount = static_cast<int>(kLookPresetNames.size());
 constexpr int kBuiltInTonescalePresetCount = static_cast<int>(kTonescalePresetNames.size());
 
@@ -1937,12 +2049,14 @@ class OpenDRTEffect : public OFX::ImageEffect {
     updatePresetManagerActionState(0.0);
     updateReadonlyDisplayLabels(0.0);
     cubeViewerLive_ = getBool("cubeViewerLive", 0.0, 1) != 0;
-    cubeViewerQuality_ = getChoice("cubeViewerQuality", 0.0, 1);
+    cubeViewerQuality_ = getChoice("cubeViewerQuality", 0.0, 0);
     setBool("cubeViewerIdentity", getChoice("cubeViewerSource", 0.0, 0) == 0 ? 1 : 0);
     setCubeViewerStatusLabel("Disconnected");
+    startCubeViewerStatusMonitor();
   }
 
   ~OpenDRTEffect() override {
+    stopCubeViewerStatusMonitor();
     allowUiParamWrites_ = false;
     closeCubeViewerSession();
 #if defined(OFX_SUPPORTS_CUDARENDER)
@@ -2055,7 +2169,8 @@ void render(const OFX::RenderArguments& args) override {
       const size_t dstRowBytes = dstRb < 0 ? static_cast<size_t>(-dstRb) : static_cast<size_t>(dstRb);
       if (srcDevice != nullptr && dstDevice != nullptr &&
           processor_->renderCUDAHostBuffers(srcDevice, dstDevice, width, height, srcRowBytes, dstRowBytes, args.pCudaStream)) {
-        if (wantInputCloud && shouldEmitCubeViewerInputCloud(args.time)) {
+        if (wantInputCloud && isFullFrameRenderWindow(bounds, args.renderWindow) && isHighQualityRenderForCloud(args) &&
+            shouldEmitCubeViewerInputCloud(args.time)) {
           const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
           if (ensureStageBuffers(pixelCount)) {
             float* srcStage = stageSrcPtr();
@@ -2082,7 +2197,7 @@ void render(const OFX::RenderArguments& args) override {
                   cudaMemcpyDeviceToHost,
                   hostStream);
               if (eSrc == cudaSuccess && eDst == cudaSuccess) {
-                const cudaError_t eSync = cudaStreamSynchronize(hostStream);
+                  const cudaError_t eSync = cudaStreamSynchronize(hostStream);
                 if (eSync == cudaSuccess) {
                   (void)emitCubeViewerInputCloud(
                       srcStage, cloudRowBytes, dstStage, cloudRowBytes, width, height);
@@ -2225,12 +2340,17 @@ void render(const OFX::RenderArguments& args) override {
       renderedDstPitch = rowBytes;
     }
 
-    if (rendered) {
+    if (rendered && isFullFrameRenderWindow(bounds, args.renderWindow) && isHighQualityRenderForCloud(args)) {
       (void)pushCubeViewerInputCloud(
           args.time, renderedSrcBase, renderedSrcPitch, renderedDstBase, renderedDstPitch, width, height);
     }
 
     perfLog("Render total", tRenderStart);
+  }
+
+  void syncPrivateData() override {
+    refreshCubeViewerConnectionHealth();
+    flushPendingCubeViewerStatusLabel();
   }
 
   // ===== UI Event Entry =====
@@ -2240,6 +2360,7 @@ void render(const OFX::RenderArguments& args) override {
 void changedParam(const OFX::InstanceChangedArgs& args, const std::string& paramName) override {
     try {
       refreshCubeViewerConnectionHealth();
+      flushPendingCubeViewerStatusLabel();
       if (suppressParamChanged_) {
         return;
       }
@@ -3793,21 +3914,102 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
   void setCubeViewerStatusLabel(const std::string& status) {
     if (cubeViewerStatusCache_ == status) return;
     cubeViewerStatusCache_ = status;
+    {
+      std::lock_guard<std::mutex> lock(cubeViewerStatusMutex_);
+      cubeViewerStatusPending_ = status;
+      cubeViewerStatusDirty_ = true;
+    }
     if (!allowUiParamWrites_) return;
-    setString("cubeViewerStatus", status);
+    setParamSetNeedsSyncing();
   }
 
-  // Render-safe viewer liveness probe: never writes OFX params here; just updates internal gating flags.
+  void flushPendingCubeViewerStatusLabel() {
+    if (!allowUiParamWrites_) return;
+    std::string status;
+    {
+      std::lock_guard<std::mutex> lock(cubeViewerStatusMutex_);
+      if (!cubeViewerStatusDirty_) return;
+      status = cubeViewerStatusPending_;
+      cubeViewerStatusDirty_ = false;
+    }
+    setString("cubeViewerStatus", status);
+    // Force host UI refresh so status text is visible immediately without node switch.
+    redrawOverlays();
+  }
+
+  void startCubeViewerStatusMonitor() {
+    if (cubeViewerStatusMonitorRunning_.load(std::memory_order_relaxed)) return;
+    cubeViewerStatusMonitorStop_.store(false, std::memory_order_relaxed);
+    cubeViewerStatusMonitorThread_ = std::thread([this]() {
+      cubeViewerStatusMonitorRunning_.store(true, std::memory_order_relaxed);
+      while (!cubeViewerStatusMonitorStop_.load(std::memory_order_relaxed)) {
+        if (cubeViewerRequested_ || cubeViewerConnected_ || cubeViewerProcessId_ != 0) {
+          refreshCubeViewerConnectionHealth();
+          // Resolve UI may not repaint read-only param widgets unless we push value writes proactively.
+          // Keep this best-effort; pending/dedup logic avoids redundant writes.
+          flushPendingCubeViewerStatusLabel();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      }
+      cubeViewerStatusMonitorRunning_.store(false, std::memory_order_relaxed);
+    });
+  }
+
+  void stopCubeViewerStatusMonitor() {
+    cubeViewerStatusMonitorStop_.store(true, std::memory_order_relaxed);
+    if (cubeViewerStatusMonitorThread_.joinable()) {
+      cubeViewerStatusMonitorThread_.join();
+    }
+  }
+
+  bool cubeViewerRuntimeActiveForStreaming() const {
+    if (!cubeViewerRequested_) return false;
+    if (!cubeViewerLive_) return false;
+    if (!cubeViewerConnected_) return true;
+    return cubeViewerWindowUsable_;
+  }
+
+  // Render-thread viewer liveness probe: keeps streaming gate/state up to date during playback.
 void refreshCubeViewerRuntimeStateRenderSafe() {
     if (!cubeViewerRequested_) return;
-#if defined(_WIN32)
-    // Do not hard-reset viewer session state from render thread based on window lookup.
-    // The external GLFW viewer does not guarantee a stable Win32 class/title here,
-    // and false negatives would disable all live updates/cloud streaming.
-    cubeViewerWindowUsable_ = cubeViewerConnected_;
-#else
-    cubeViewerWindowUsable_ = cubeViewerConnected_;
-#endif
+    const auto now = std::chrono::steady_clock::now();
+    if (cubeViewerLastRenderProbeAt_ != std::chrono::steady_clock::time_point::min()) {
+      const auto elapsedMs =
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - cubeViewerLastRenderProbeAt_).count();
+      if (elapsedMs < 200) return;
+    }
+    cubeViewerLastRenderProbeAt_ = now;
+    int active = 1;
+    int visible = 1;
+    int minimized = 0;
+    int focused = 1;
+    // Render-thread probe is intentionally short and non-blocking-ish.
+    // If it misses, keep prior state and let UI heartbeat decide disconnect.
+    if (sendCubeViewerHeartbeatProbe(&active, &visible, &minimized, &focused, 2)) {
+      cubeViewerRenderProbeFailCount_ = 0;
+      cubeViewerConnected_ = true;
+      cubeViewerWindowUsable_ = (active != 0 && visible != 0 && minimized == 0);
+      cubeViewerLastStateVisible_ = (visible != 0);
+      cubeViewerLastStateMinimized_ = (minimized != 0);
+      cubeViewerLastStateFocused_ = (focused != 0);
+      if (!cubeViewerWindowUsable_) {
+        setCubeViewerStatusLabel("Connected (idle)");
+      } else if (cubeViewerStatusCache_ == "Disconnected" || cubeViewerStatusCache_.find("failed") != std::string::npos ||
+                 cubeViewerStatusCache_ == "Connected (idle)") {
+        setCubeViewerStatusLabel("Connected");
+      }
+    } else {
+      ++cubeViewerRenderProbeFailCount_;
+      // Stop heavy cloud processing immediately when runtime probe fails.
+      cubeViewerWindowUsable_ = false;
+      if (cubeViewerRenderProbeFailCount_ >= 2) {
+        cubeViewerConnected_ = false;
+        cubeViewerLastStateVisible_ = false;
+        cubeViewerLastStateMinimized_ = false;
+        cubeViewerLastStateFocused_ = false;
+        setCubeViewerStatusLabel("Disconnected");
+      }
+    }
   }
 
   // UI-thread heartbeat: keeps status label truthful and detects stale/disconnected viewer sessions.
@@ -3837,16 +4039,35 @@ void refreshCubeViewerConnectionHealth() {
       if (elapsedMs < 500) return;
     }
     cubeViewerLastHeartbeatAt_ = now;
-    if (sendCubeViewerMessage("{\"type\":\"heartbeat\"}")) {
+    int active = 1;
+    int visible = 1;
+    int minimized = 0;
+    int focused = 1;
+    if (sendCubeViewerHeartbeatProbe(&active, &visible, &minimized, &focused)) {
+      cubeViewerHeartbeatFailCount_ = 0;
       cubeViewerConnected_ = true;
-      cubeViewerWindowUsable_ = true;
-      if (cubeViewerStatusCache_ == "Disconnected" || cubeViewerStatusCache_.find("failed") != std::string::npos) {
+      cubeViewerWindowUsable_ = (active != 0 && visible != 0 && minimized == 0);
+      if (cubeViewerWindowUsable_) {
+        cubeViewerLastStateVisible_ = (visible != 0);
+        cubeViewerLastStateMinimized_ = (minimized != 0);
+        cubeViewerLastStateFocused_ = (focused != 0);
+      }
+      if (!cubeViewerWindowUsable_) {
+        setCubeViewerStatusLabel("Connected (idle)");
+      } else if (cubeViewerStatusCache_ == "Disconnected" || cubeViewerStatusCache_.find("failed") != std::string::npos ||
+                 cubeViewerStatusCache_ == "Connected (idle)") {
         setCubeViewerStatusLabel("Connected");
       }
     } else {
-      cubeViewerConnected_ = false;
-      cubeViewerWindowUsable_ = false;
-      setCubeViewerStatusLabel("Disconnected");
+      ++cubeViewerHeartbeatFailCount_;
+      if (cubeViewerHeartbeatFailCount_ >= 3) {
+        cubeViewerConnected_ = false;
+        cubeViewerWindowUsable_ = false;
+        cubeViewerLastStateVisible_ = false;
+        cubeViewerLastStateMinimized_ = false;
+        cubeViewerLastStateFocused_ = false;
+        setCubeViewerStatusLabel("Disconnected");
+      }
     }
   }
 
@@ -3901,7 +4122,7 @@ std::string buildCubeViewerParamsJson(double time, bool deltaOnly, const std::st
   // Update throttle gate for param snapshots/deltas to protect host responsiveness under rapid scrubbing.
 bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedParam, double time) {
     if (!cubeViewerRequested_) return false;
-    if (!cubeViewerLive_ && !forceSnapshot) return false;
+    if (!forceSnapshot && !cubeViewerLive_) return false;
     const auto now = std::chrono::steady_clock::now();
     if (!forceSnapshot) {
       const auto sinceLast = std::chrono::duration_cast<std::chrono::milliseconds>(now - cubeViewerLastSendAt_);
@@ -3916,6 +4137,8 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
   // Input-cloud gate: only emit when viewer is live/visible and source mode is input-image.
 bool shouldEmitCubeViewerInputCloud(double time) {
     if (!cubeViewerRequested_ || !cubeViewerLive_) return false;
+    if (!cubeViewerConnected_) return false;
+    if (!cubeViewerWindowUsable_) return false;
     if (getBool("cubeViewerIdentity", time, 1) != 0) return false;
     const auto now = std::chrono::steady_clock::now();
     if (cubeViewerLastCloudSendAt_ != std::chrono::steady_clock::time_point::min()) {
@@ -3927,7 +4150,7 @@ bool shouldEmitCubeViewerInputCloud(double time) {
   }
 
   // Input-cloud encoder: samples source/destination pairs into a compact point stream for viewer plotting.
-bool emitCubeViewerInputCloud(
+  bool emitCubeViewerInputCloud(
       const float* srcBase,
       size_t srcRowBytes,
       const float* dstBase,
@@ -3941,8 +4164,10 @@ bool emitCubeViewerInputCloud(
     if (cubeViewerQuality_ <= 0) maxPts = 45000;
     else if (cubeViewerQuality_ >= 2) maxPts = 180000;
     const size_t pxCount = static_cast<size_t>(width) * static_cast<size_t>(height);
-    const size_t targetPts = (maxPts < pxCount) ? maxPts : pxCount;
-    if (targetPts == 0u) return false;
+    if (pxCount == 0u) return false;
+    // Keep a stable point budget per quality tier so drag/release does not appear to "switch quality"
+    // when host preview resolution changes during interactive edits.
+    const size_t targetPts = maxPts;
     const size_t srcStrideFloats = srcRowBytes / sizeof(float);
     const size_t dstStrideFloats = dstRowBytes / sizeof(float);
 
@@ -3953,26 +4178,60 @@ bool emitCubeViewerInputCloud(
     auto clamp01 = [](float v) -> float {
       return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
     };
-    const size_t seqSeed = static_cast<size_t>(cubeViewerSeq_.load(std::memory_order_relaxed));
-    const size_t start = (pxCount > 1u) ? (seqSeed % pxCount) : 0u;
-    size_t step = (pxCount > targetPts) ? (pxCount / targetPts) : 1u;
-    if (step < 1u) step = 1u;
-    if ((step & 1u) == 0u) step += 1u;
-    while (std::gcd(step, pxCount) != 1u) step += 2u;
+    auto halton = [](size_t index, int base) -> float {
+      float f = 1.0f;
+      float r = 0.0f;
+      size_t i = index;
+      while (i > 0u) {
+        f /= static_cast<float>(base);
+        r += f * static_cast<float>(i % static_cast<size_t>(base));
+        i /= static_cast<size_t>(base);
+      }
+      return r;
+    };
+
+    auto sampleRGBBilinear = [](const float* base, size_t strideFloats, int w, int h, float u, float v, float* r, float* g, float* b) {
+      if (!base || w <= 0 || h <= 0 || !r || !g || !b) return false;
+      const float x = u * static_cast<float>(w - 1);
+      const float y = v * static_cast<float>(h - 1);
+      int x0 = static_cast<int>(std::floor(x));
+      int y0 = static_cast<int>(std::floor(y));
+      int x1 = x0 + 1;
+      int y1 = y0 + 1;
+      if (x0 < 0) x0 = 0;
+      if (y0 < 0) y0 = 0;
+      if (x1 >= w) x1 = w - 1;
+      if (y1 >= h) y1 = h - 1;
+      const float tx = x - static_cast<float>(x0);
+      const float ty = y - static_cast<float>(y0);
+
+      auto at = [&](int px, int py, int c) -> float {
+        const size_t idx = static_cast<size_t>(py) * strideFloats + static_cast<size_t>(px) * 4u + static_cast<size_t>(c);
+        return base[idx];
+      };
+
+      const float w00 = (1.0f - tx) * (1.0f - ty);
+      const float w10 = tx * (1.0f - ty);
+      const float w01 = (1.0f - tx) * ty;
+      const float w11 = tx * ty;
+
+      *r = at(x0, y0, 0) * w00 + at(x1, y0, 0) * w10 + at(x0, y1, 0) * w01 + at(x1, y1, 0) * w11;
+      *g = at(x0, y0, 1) * w00 + at(x1, y0, 1) * w10 + at(x0, y1, 1) * w01 + at(x1, y1, 1) * w11;
+      *b = at(x0, y0, 2) * w00 + at(x1, y0, 2) * w10 + at(x0, y1, 2) * w01 + at(x1, y1, 2) * w11;
+      return true;
+    };
 
     for (size_t n = 0; n < targetPts; ++n) {
-      const size_t linear = (start + n * step) % pxCount;
-      const int y = static_cast<int>(linear / static_cast<size_t>(width));
-      const int x = static_cast<int>(linear % static_cast<size_t>(width));
-
-      const size_t srcPix = static_cast<size_t>(y) * srcStrideFloats + static_cast<size_t>(x) * 4u;
-      const size_t dstPix = static_cast<size_t>(y) * dstStrideFloats + static_cast<size_t>(x) * 4u;
-      const float sr = srcBase[srcPix + 0];
-      const float sg = srcBase[srcPix + 1];
-      const float sb = srcBase[srcPix + 2];
-      const float dr = dstBase[dstPix + 0];
-      const float dg = dstBase[dstPix + 1];
-      const float db = dstBase[dstPix + 2];
+      // Sample fixed normalized locations so drag/release host render-scale changes
+      // do not produce visibly different cloud geometry.
+      const float u = halton(n + 1u, 2);
+      const float v = halton(n + 1u, 3);
+      float sr = 0.0f, sg = 0.0f, sb = 0.0f;
+      float dr = 0.0f, dg = 0.0f, db = 0.0f;
+      if (!sampleRGBBilinear(srcBase, srcStrideFloats, width, height, u, v, &sr, &sg, &sb) ||
+          !sampleRGBBilinear(dstBase, dstStrideFloats, width, height, u, v, &dr, &dg, &db)) {
+        continue;
+      }
       if (!std::isfinite(sr) || !std::isfinite(sg) || !std::isfinite(sb) ||
           !std::isfinite(dr) || !std::isfinite(dg) || !std::isfinite(db)) {
         continue;
@@ -4019,6 +4278,21 @@ bool emitCubeViewerInputCloud(
     return emitCubeViewerInputCloud(srcBase, srcRowBytes, dstBase, dstRowBytes, width, height);
   }
 
+  bool isFullFrameRenderWindow(const OfxRectI& fullBounds, const OfxRectI& renderWindow) const {
+    if (renderWindow.x2 <= renderWindow.x1 || renderWindow.y2 <= renderWindow.y1) return false;
+    return renderWindow.x1 <= fullBounds.x1 && renderWindow.y1 <= fullBounds.y1 && renderWindow.x2 >= fullBounds.x2 &&
+           renderWindow.y2 >= fullBounds.y2;
+  }
+
+  bool isHighQualityRenderForCloud(const OFX::RenderArguments& args) const {
+    const double sx = args.renderScale.x;
+    const double sy = args.renderScale.y;
+    const bool fullScale = (sx >= 0.999 && sy >= 0.999);
+    if (!fullScale) return false;
+    if (args.renderQualityDraft) return false;
+    return true;
+  }
+
   // Connection-facing publish step: send latest payload and update cached connection state.
 void pushCubeViewerUpdate(double time, const std::string& changedParam, bool forceSnapshot = false) {
     if (!shouldEmitCubeViewerUpdate(forceSnapshot, changedParam, time)) return;
@@ -4054,7 +4328,13 @@ void openCubeViewerSession(double time) {
     cubeViewerQuality_ = getChoice("cubeViewerQuality", time, 1);
     cubeViewerLastHeartbeatAt_ = std::chrono::steady_clock::time_point::min();
     cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+    cubeViewerLastRenderProbeAt_ = std::chrono::steady_clock::time_point::min();
+    cubeViewerHeartbeatFailCount_ = 0;
+    cubeViewerRenderProbeFailCount_ = 0;
     cubeViewerWindowUsable_ = true;
+    cubeViewerLastStateVisible_ = true;
+    cubeViewerLastStateMinimized_ = false;
+    cubeViewerLastStateFocused_ = true;
     setCubeViewerStatusLabel("Launching");
     if (connectCubeViewerWithRetry(3, 40)) {
       cubeViewerConnected_ = true;
@@ -4108,8 +4388,14 @@ void closeCubeViewerSession() {
     cubeViewerConnected_ = false;
     cubeViewerProcessId_ = 0;
     cubeViewerWindowUsable_ = false;
+    cubeViewerLastStateVisible_ = false;
+    cubeViewerLastStateMinimized_ = false;
+    cubeViewerLastStateFocused_ = false;
     cubeViewerLastHeartbeatAt_ = std::chrono::steady_clock::time_point::min();
     cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+    cubeViewerLastRenderProbeAt_ = std::chrono::steady_clock::time_point::min();
+    cubeViewerHeartbeatFailCount_ = 0;
+    cubeViewerRenderProbeFailCount_ = 0;
     setCubeViewerStatusLabel("Disconnected");
   }
 
@@ -4237,14 +4523,26 @@ void closeCubeViewerSession() {
   uint32_t cubeViewerProcessId_ = 0;
   bool cubeViewerLive_ = true;
   bool cubeViewerWindowUsable_ = false;
+  bool cubeViewerLastStateVisible_ = true;
+  bool cubeViewerLastStateMinimized_ = false;
+  bool cubeViewerLastStateFocused_ = true;
   int cubeViewerQuality_ = 1;
   std::atomic<uint64_t> cubeViewerSeq_{1};
   std::string cubeViewerStatusCache_ = "Disconnected";
+  std::mutex cubeViewerStatusMutex_;
+  std::string cubeViewerStatusPending_ = "Disconnected";
+  bool cubeViewerStatusDirty_ = false;
+  std::thread cubeViewerStatusMonitorThread_;
+  std::atomic<bool> cubeViewerStatusMonitorStop_{false};
+  std::atomic<bool> cubeViewerStatusMonitorRunning_{false};
   bool allowUiParamWrites_ = true;
   std::string cubeViewerLastParam_;
   std::chrono::steady_clock::time_point cubeViewerLastSendAt_ = std::chrono::steady_clock::time_point::min();
   std::chrono::steady_clock::time_point cubeViewerLastHeartbeatAt_ = std::chrono::steady_clock::time_point::min();
   std::chrono::steady_clock::time_point cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+  std::chrono::steady_clock::time_point cubeViewerLastRenderProbeAt_ = std::chrono::steady_clock::time_point::min();
+  int cubeViewerHeartbeatFailCount_ = 0;
+  int cubeViewerRenderProbeFailCount_ = 0;
   std::string cubeViewerSenderId_;
 };
 
@@ -4258,7 +4556,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   // ===== Plugin Descriptor =====
   // Host capability advertisement and static metadata.
   void describe(OFX::ImageEffectDescriptor& d) override {
-    static const std::string nameWithVersion = "ME_OpenDRT v1.2.1";
+    static const std::string nameWithVersion = "ME_OpenDRT v1.2.2";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -4593,15 +4891,16 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     cubeViewerQuality->appendOption("Low");
     cubeViewerQuality->appendOption("Medium");
     cubeViewerQuality->appendOption("High");
-    cubeViewerQuality->setDefault(1);
+    cubeViewerQuality->setDefault(0);
     cubeViewerQuality->setParent(*grpCubeViewer);
     if (const char* hint = tooltipForParam("cubeViewerQuality")) cubeViewerQuality->setHint(hint);
     pCubeViewer->addChild(*cubeViewerQuality);
 
     auto* cubeViewerStatus = d.defineStringParam("cubeViewerStatus");
     cubeViewerStatus->setLabel("Viewer Status");
+    cubeViewerStatus->setStringType(OFX::eStringTypeLabel);
     cubeViewerStatus->setDefault("Disconnected");
-    cubeViewerStatus->setEnabled(false);
+    cubeViewerStatus->setEnabled(true);
     cubeViewerStatus->setParent(*grpCubeViewer);
     if (const char* hint = tooltipForParam("cubeViewerStatus")) cubeViewerStatus->setHint(hint);
     pCubeViewer->addChild(*cubeViewerStatus);
@@ -4646,7 +4945,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
     supportOfxVersion->setLabel("OFX version");
-    supportOfxVersion->setDefault("v1.2.1");
+    supportOfxVersion->setDefault("v1.2.2");
     supportOfxVersion->setEnabled(false);
     supportOfxVersion->setParent(*grpSupportRoot);
     pSupport->addChild(*supportOfxVersion);
