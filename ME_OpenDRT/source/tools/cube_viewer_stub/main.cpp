@@ -83,12 +83,132 @@ void logViewerEvent(const std::string& msg) {
 }
 
 struct CameraState {
-  float yawDeg = -45.0f;
-  float pitchDeg = 20.0f;
+  float qx = 0.0f;
+  float qy = 0.0f;
+  float qz = 0.0f;
+  float qw = 1.0f;
   float distance = 4.35f;
   float panX = 0.0f;
   float panY = 0.12f;
 };
+
+struct Vec3 {
+  float x = 0.0f;
+  float y = 0.0f;
+  float z = 0.0f;
+};
+
+struct Quat {
+  float x = 0.0f;
+  float y = 0.0f;
+  float z = 0.0f;
+  float w = 1.0f;
+};
+
+inline float clampf(float v, float lo, float hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+inline float length3(Vec3 v) {
+  return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+}
+
+inline Vec3 normalize3(Vec3 v) {
+  const float len = length3(v);
+  if (len <= 1e-8f) return Vec3{};
+  const float inv = 1.0f / len;
+  return Vec3{v.x * inv, v.y * inv, v.z * inv};
+}
+
+inline Vec3 cross3(Vec3 a, Vec3 b) {
+  return Vec3{
+      a.y * b.z - a.z * b.y,
+      a.z * b.x - a.x * b.z,
+      a.x * b.y - a.y * b.x};
+}
+
+inline float dot3(Vec3 a, Vec3 b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+inline Quat normalizeQ(Quat q) {
+  const float len = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+  if (len <= 1e-8f) return Quat{};
+  const float inv = 1.0f / len;
+  return Quat{q.x * inv, q.y * inv, q.z * inv, q.w * inv};
+}
+
+inline Quat mulQ(Quat a, Quat b) {
+  return Quat{
+      a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+      a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+      a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+      a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+
+inline Quat axisAngleQ(Vec3 axis, float radians) {
+  const Vec3 n = normalize3(axis);
+  const float h = radians * 0.5f;
+  const float s = std::sin(h);
+  return normalizeQ(Quat{n.x * s, n.y * s, n.z * s, std::cos(h)});
+}
+
+Vec3 mapArcball(double sx, double sy, int width, int height) {
+  if (width < 1) width = 1;
+  if (height < 1) height = 1;
+  const float nx = static_cast<float>((2.0 * sx - static_cast<double>(width)) / static_cast<double>(width));
+  const float ny = static_cast<float>((static_cast<double>(height) - 2.0 * sy) / static_cast<double>(height));
+  const float d2 = nx * nx + ny * ny;
+  if (d2 <= 1.0f) return Vec3{nx, ny, std::sqrt(1.0f - d2)};
+  const float inv = 1.0f / std::sqrt(d2);
+  return Vec3{nx * inv, ny * inv, 0.0f};
+}
+
+void quatToMatrix(Quat q, float out16[16]) {
+  q = normalizeQ(q);
+  const float xx = q.x * q.x;
+  const float yy = q.y * q.y;
+  const float zz = q.z * q.z;
+  const float xy = q.x * q.y;
+  const float xz = q.x * q.z;
+  const float yz = q.y * q.z;
+  const float wx = q.w * q.x;
+  const float wy = q.w * q.y;
+  const float wz = q.w * q.z;
+  // Column-major for OpenGL fixed-function pipeline.
+  out16[0] = 1.0f - 2.0f * (yy + zz);
+  out16[1] = 2.0f * (xy + wz);
+  out16[2] = 2.0f * (xz - wy);
+  out16[3] = 0.0f;
+  out16[4] = 2.0f * (xy - wz);
+  out16[5] = 1.0f - 2.0f * (xx + zz);
+  out16[6] = 2.0f * (yz + wx);
+  out16[7] = 0.0f;
+  out16[8] = 2.0f * (xz + wy);
+  out16[9] = 2.0f * (yz - wx);
+  out16[10] = 1.0f - 2.0f * (xx + yy);
+  out16[11] = 0.0f;
+  out16[12] = 0.0f;
+  out16[13] = 0.0f;
+  out16[14] = 0.0f;
+  out16[15] = 1.0f;
+}
+
+void resetCamera(CameraState* cam) {
+  if (!cam) return;
+  cam->distance = 4.35f;
+  cam->panX = 0.0f;
+  cam->panY = 0.12f;
+  // Preserve previous default orientation: pitch 20 then yaw -45.
+  const float deg2rad = 3.14159265358979323846f / 180.0f;
+  const Quat qPitch = axisAngleQ(Vec3{1.0f, 0.0f, 0.0f}, 20.0f * deg2rad);
+  const Quat qYaw = axisAngleQ(Vec3{0.0f, 1.0f, 0.0f}, -45.0f * deg2rad);
+  const Quat q = normalizeQ(mulQ(qPitch, qYaw));
+  cam->qx = q.x;
+  cam->qy = q.y;
+  cam->qz = q.z;
+  cam->qw = q.w;
+}
 
 struct MeshData {
   int resolution = 33;
@@ -768,7 +888,7 @@ void processMouseAndKeys(GLFWwindow* window, AppState* app) {
     app->lastY = cy;
     const double now = glfwGetTime();
     if (l == GLFW_PRESS && (now - app->lastClick) < 0.3) {
-      app->cam = CameraState{};
+      resetCamera(&app->cam);
     }
     app->lastClick = now;
   } else if (!anyDown && app->leftDown) {
@@ -786,10 +906,25 @@ void processMouseAndKeys(GLFWwindow* window, AppState* app) {
       app->cam.panX += dx * panScale;
       app->cam.panY -= dy * panScale;
     } else {
-      app->cam.yawDeg += dx * 0.35f;
-      app->cam.pitchDeg += dy * 0.35f;
-      if (app->cam.pitchDeg < -89.0f) app->cam.pitchDeg = -89.0f;
-      if (app->cam.pitchDeg > 89.0f) app->cam.pitchDeg = 89.0f;
+      int w = 1, h = 1;
+      glfwGetWindowSize(window, &w, &h);
+      Vec3 v0 = mapArcball(app->lastX - dx, app->lastY - dy, w, h);
+      Vec3 v1 = mapArcball(app->lastX, app->lastY, w, h);
+      Vec3 axis = cross3(v0, v1);
+      const float axisLen = length3(axis);
+      float d = dot3(v0, v1);
+      d = clampf(d, -1.0f, 1.0f);
+      const float angle = std::acos(d);
+      if (axisLen > 1e-6f && angle > 1e-6f) {
+        const float arcballGain = 1.35f;
+        const Quat qDelta = axisAngleQ(axis, angle * arcballGain);
+        Quat qCur{app->cam.qx, app->cam.qy, app->cam.qz, app->cam.qw};
+        qCur = normalizeQ(mulQ(qDelta, qCur));
+        app->cam.qx = qCur.x;
+        app->cam.qy = qCur.y;
+        app->cam.qz = qCur.z;
+        app->cam.qw = qCur.w;
+      }
     }
   }
 
@@ -803,7 +938,7 @@ void processMouseAndKeys(GLFWwindow* window, AppState* app) {
   }
 
   if (glfwGetKey(window, GLFW_KEY_R) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS) {
-    app->cam = CameraState{};
+    resetCamera(&app->cam);
   }
 }
 
@@ -860,6 +995,7 @@ int runApp() {
   }
 
   AppState app{};
+  resetCamera(&app.cam);
   glfwSetWindowUserPointer(window, &app);
   glfwSetFramebufferSizeCallback(window, onFramebufferSize);
   glfwSetWindowCloseCallback(window, onWindowClose);
@@ -978,8 +1114,9 @@ int runApp() {
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
     glTranslatef(app.cam.panX, app.cam.panY, -app.cam.distance);
-    glRotatef(app.cam.pitchDeg, 1.0f, 0.0f, 0.0f);
-    glRotatef(app.cam.yawDeg, 0.0f, 1.0f, 0.0f);
+    float rotM[16];
+    quatToMatrix(Quat{app.cam.qx, app.cam.qy, app.cam.qz, app.cam.qw}, rotM);
+    glMultMatrixf(rotM);
 
     drawReferenceFrame();
 
