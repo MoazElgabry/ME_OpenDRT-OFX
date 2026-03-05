@@ -1143,8 +1143,8 @@ int runApp() {
     glVertexPointer(3, GL_FLOAT, 0, mesh.pointVerts.empty() ? nullptr : mesh.pointVerts.data());
     glColorPointer(3, GL_FLOAT, 0, mesh.pointColors.empty() ? nullptr : mesh.pointColors.data());
     glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(mesh.pointVerts.size() / 3u));
-    if (!mesh.pointVerts.empty() && app.currentSourceMode != "input") {
-      // Subtle interior fill pass to improve visibility around the cube core/achromatic axis.
+    if (!mesh.pointVerts.empty()) {
+      // Subtle interior fill pass to improve interior visibility for both identity and input cloud modes.
       glDisable(GL_DEPTH_TEST);
       glDisableClientState(GL_COLOR_ARRAY);
       glColor4f(0.95f, 0.96f, 1.0f, 0.05f);

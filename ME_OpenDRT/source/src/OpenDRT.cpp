@@ -4172,8 +4172,8 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
   // Input-cloud gate: only emit when viewer is live/visible and source mode is input-image.
 bool shouldEmitCubeViewerInputCloud(double time) {
     if (!cubeViewerRequested_ || !cubeViewerLive_) return false;
-    if (!cubeViewerConnected_) return false;
-    if (!cubeViewerWindowUsable_) return false;
+    // Allow emit path to self-heal stale connection state by attempting reconnect.
+    if (!cubeViewerRuntimeActiveForStreaming()) return false;
     if (getBool("cubeViewerIdentity", time, 1) != 0) return false;
     const auto now = std::chrono::steady_clock::now();
     if (cubeViewerLastCloudSendAt_ != std::chrono::steady_clock::time_point::min()) {
@@ -4279,6 +4279,7 @@ bool shouldEmitCubeViewerInputCloud(double time) {
       pts << clamp01(sr) << ' ' << clamp01(sg) << ' ' << clamp01(sb) << ' '
           << clamp01(dr) << ' ' << clamp01(dg) << ' ' << clamp01(db);
     }
+    if (first) return false;
 
     std::ostringstream os;
     os << "{";
@@ -4293,12 +4294,14 @@ bool shouldEmitCubeViewerInputCloud(double time) {
     os << "\"points\":\"" << jsonEscape(pts.str()) << "\"";
     os << "}";
 
-    if (sendCubeViewerMessage(os.str())) {
+    if (sendCubeViewerMessage(os.str()) || (connectCubeViewerWithRetry(1, 10) && sendCubeViewerMessage(os.str()))) {
       cubeViewerConnected_ = true;
+      cubeViewerWindowUsable_ = true;
       setCubeViewerStatusLabel("Updating");
       return true;
     }
     cubeViewerConnected_ = false;
+    cubeViewerWindowUsable_ = false;
     setCubeViewerStatusLabel("Disconnected");
     return false;
   }
@@ -4593,7 +4596,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   // ===== Plugin Descriptor =====
   // Host capability advertisement and static metadata.
   void describe(OFX::ImageEffectDescriptor& d) override {
-    static const std::string nameWithVersion = "ME_OpenDRT v1.2.5";
+      static const std::string nameWithVersion = "ME_OpenDRT v1.2.6";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -4982,7 +4985,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
     supportOfxVersion->setLabel("OFX version");
-    supportOfxVersion->setDefault("v1.2.5");
+    supportOfxVersion->setDefault("v1.2.6");
     supportOfxVersion->setEnabled(false);
     supportOfxVersion->setParent(*grpSupportRoot);
     pSupport->addChild(*supportOfxVersion);
