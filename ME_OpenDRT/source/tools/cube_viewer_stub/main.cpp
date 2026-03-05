@@ -1134,7 +1134,9 @@ int runApp() {
     float densityFactor = 1.0f;
     if (pointCount < 8000u) densityFactor = 1.10f;
     else if (pointCount > 50000u) densityFactor = 0.92f;
-    float pointSize = basePointSize * distanceFactor * densityFactor;
+    // QUICK_TWEAK_POINT_SIZE: adjust this multiplier to make cube sample points smaller/larger.
+    const float kPointSizeUserScale = 1.16f;
+    float pointSize = basePointSize * distanceFactor * densityFactor * kPointSizeUserScale;
     if (pointSize < 1.2f) pointSize = 1.2f;
     if (pointSize > 5.0f) pointSize = 5.0f;
     glPointSize(pointSize);

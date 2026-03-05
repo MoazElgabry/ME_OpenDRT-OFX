@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(ME_OpenDRT VERSION 1.2.4 LANGUAGES CXX)
+project(ME_OpenDRT VERSION 1.2.5 LANGUAGES CXX)
 
 set(PLUGIN_BASENAME "ME_OpenDRT")
 option(ME_OPENDRT_LINUX_CUDA "Enable CUDA backend on Linux builds" ON)
@@ -174,6 +174,7 @@ set_target_properties(${PLUGIN_BASENAME} PROPERTIES
 if(WIN32)
   set(OFX_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bundle/${PLUGIN_BASENAME}.ofx.bundle/Contents/Win64")
 elseif(APPLE)
+  set(OFX_BUNDLE_CONTENTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bundle/${PLUGIN_BASENAME}.ofx.bundle/Contents")
   set(OFX_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bundle/${PLUGIN_BASENAME}.ofx.bundle/Contents/MacOS")
   set(OFX_RESOURCES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bundle/${PLUGIN_BASENAME}.ofx.bundle/Contents/Resources")
 elseif(UNIX)
@@ -181,9 +182,16 @@ elseif(UNIX)
 endif()
 file(MAKE_DIRECTORY "${OFX_OUTPUT_DIR}")
 if(APPLE)
+  file(MAKE_DIRECTORY "${OFX_BUNDLE_CONTENTS_DIR}")
   file(MAKE_DIRECTORY "${OFX_RESOURCES_DIR}")
+  configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Info.plist.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
+    @ONLY
+  )
   add_custom_command(TARGET ${PLUGIN_BASENAME} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${METAL_LIB}" "${OFX_RESOURCES_DIR}/OpenDRT.metallib")
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${METAL_LIB}" "${OFX_RESOURCES_DIR}/OpenDRT.metallib"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" "${OFX_BUNDLE_CONTENTS_DIR}/Info.plist")
 endif()
 
 set_target_properties(${PLUGIN_BASENAME} PROPERTIES

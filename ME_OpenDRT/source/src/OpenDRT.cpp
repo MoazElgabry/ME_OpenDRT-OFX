@@ -2161,6 +2161,9 @@ void render(const OFX::RenderArguments& args) override {
         }
         prev = cur;
       }
+      // Direct path assumes monotonically increasing rows with positive pitch.
+      // Some hosts can expose reverse/negative row stepping; use staged path there.
+      if (step <= 0) return RowLayout{};
       out.valid = true;
       out.pitchBytes = static_cast<size_t>(step);
       out.contiguous = (out.pitchBytes == rowBytes);
@@ -4202,6 +4205,8 @@ bool shouldEmitCubeViewerInputCloud(double time) {
     const size_t targetPts = maxPts;
     const size_t srcStrideFloats = srcRowBytes / sizeof(float);
     const size_t dstStrideFloats = dstRowBytes / sizeof(float);
+    const size_t minStrideFloats = static_cast<size_t>(width) * 4u;
+    if (srcStrideFloats < minStrideFloats || dstStrideFloats < minStrideFloats) return false;
 
     std::ostringstream pts;
     pts.setf(std::ios::fixed);
@@ -4588,7 +4593,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   // ===== Plugin Descriptor =====
   // Host capability advertisement and static metadata.
   void describe(OFX::ImageEffectDescriptor& d) override {
-    static const std::string nameWithVersion = "ME_OpenDRT v1.2.4";
+    static const std::string nameWithVersion = "ME_OpenDRT v1.2.5";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -4932,7 +4937,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     cubeViewerStatus->setLabel("Viewer Status");
     cubeViewerStatus->setStringType(OFX::eStringTypeLabel);
     cubeViewerStatus->setDefault("Disconnected");
-    cubeViewerStatus->setEnabled(true);
+    cubeViewerStatus->setEnabled(false);
     cubeViewerStatus->setParent(*grpCubeViewer);
     if (const char* hint = tooltipForParam("cubeViewerStatus")) cubeViewerStatus->setHint(hint);
     pCubeViewer->addChild(*cubeViewerStatus);
@@ -4977,7 +4982,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
     supportOfxVersion->setLabel("OFX version");
-    supportOfxVersion->setDefault("v1.2.4");
+    supportOfxVersion->setDefault("v1.2.5");
     supportOfxVersion->setEnabled(false);
     supportOfxVersion->setParent(*grpSupportRoot);
     pSupport->addChild(*supportOfxVersion);
