@@ -10,6 +10,7 @@
 #include <fstream>
 #include <cstdio>
 #include <atomic>
+#include <condition_variable>
 #include <numeric>
 #include <mutex>
 #include <memory>
@@ -2111,10 +2112,12 @@ class OpenDRTEffect : public OFX::ImageEffect {
     setBool("cubeViewerIdentity", getChoice("cubeViewerSource", 0.0, 0) == 0 ? 1 : 0);
     setCubeViewerStatusLabel("Disconnected");
     startCubeViewerStatusMonitor();
+    startCubeViewerIoWorker();
   }
 
   ~OpenDRTEffect() override {
     stopCubeViewerStatusMonitor();
+    stopCubeViewerIoWorker();
     allowUiParamWrites_ = false;
     closeCubeViewerSession();
 #if defined(OFX_SUPPORTS_CUDARENDER)
@@ -4109,6 +4112,117 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     }
   }
 
+  void startCubeViewerIoWorker() {
+    if (cubeViewerIoRunning_.load(std::memory_order_relaxed)) return;
+    cubeViewerIoStop_.store(false, std::memory_order_relaxed);
+    cubeViewerIoThread_ = std::thread([this]() {
+      cubeViewerIoRunning_.store(true, std::memory_order_relaxed);
+      for (;;) {
+        std::string paramsJson;
+        std::string paramsStatus;
+        CachedCubeViewerInputCloud cloudPayload{};
+        std::string cloudReason;
+        bool haveParams = false;
+        bool haveCloud = false;
+        {
+          std::unique_lock<std::mutex> lock(cubeViewerIoMutex_);
+          cubeViewerIoCv_.wait(lock, [this]() {
+            return cubeViewerIoStop_.load(std::memory_order_relaxed) || cubeViewerPendingParams_ || cubeViewerPendingCloud_;
+          });
+          if (cubeViewerIoStop_.load(std::memory_order_relaxed)) break;
+          if (cubeViewerPendingParams_) {
+            paramsJson = std::move(cubeViewerPendingParamsJson_);
+            paramsStatus = std::move(cubeViewerPendingParamsStatus_);
+            cubeViewerPendingParamsJson_.clear();
+            cubeViewerPendingParamsStatus_.clear();
+            cubeViewerPendingParams_ = false;
+            haveParams = !paramsJson.empty();
+          }
+          if (cubeViewerPendingCloud_) {
+            cloudPayload = cubeViewerPendingCloudPayload_;
+            cloudReason = std::move(cubeViewerPendingCloudReason_);
+            cubeViewerPendingCloudReason_.clear();
+            cubeViewerPendingCloud_ = false;
+            haveCloud = cloudPayload.valid && !cloudPayload.points.empty();
+          }
+        }
+
+        if (haveParams) {
+          if (sendCubeViewerMessage(paramsJson)) {
+            cubeViewerConnected_ = true;
+            cubeViewerWindowUsable_ = true;
+            setCubeViewerStatusLabel(paramsStatus.empty() ? "Connected" : paramsStatus);
+          } else {
+            cubeViewerConnected_ = false;
+            cubeViewerWindowUsable_ = false;
+            setCubeViewerStatusLabel("Disconnected");
+          }
+        }
+
+        if (haveCloud) {
+          const std::string json = buildCubeViewerInputCloudJson(cloudPayload);
+          if (debugLogEnabled()) {
+            std::fprintf(
+                stderr,
+                "[ME_OpenDRT] Cube input cloud send (%s): payload=%zu bytes quality=%s res=%d pending=%d\n",
+                cloudReason.empty() ? "unspecified" : cloudReason.c_str(),
+                json.size(),
+                cloudPayload.quality.c_str(),
+                cloudPayload.resolution,
+                cubeViewerInputCloudRefreshPending_ ? 1 : 0);
+          }
+          if (sendCubeViewerMessage(json)) {
+            cubeViewerConnected_ = true;
+            cubeViewerWindowUsable_ = true;
+            cubeViewerInputCloudRefreshPending_ = false;
+            setCubeViewerStatusLabel("Updating");
+          } else {
+            if (debugLogEnabled()) {
+              std::fprintf(
+                  stderr,
+                  "[ME_OpenDRT] Cube input cloud send failed (%s).\n",
+                  cloudReason.empty() ? "unspecified" : cloudReason.c_str());
+            }
+            cubeViewerConnected_ = false;
+            cubeViewerWindowUsable_ = false;
+            setCubeViewerStatusLabel("Disconnected");
+          }
+        }
+      }
+      cubeViewerIoRunning_.store(false, std::memory_order_relaxed);
+    });
+  }
+
+  void stopCubeViewerIoWorker() {
+    cubeViewerIoStop_.store(true, std::memory_order_relaxed);
+    cubeViewerIoCv_.notify_all();
+    if (cubeViewerIoThread_.joinable()) {
+      cubeViewerIoThread_.join();
+    }
+  }
+
+  void queueCubeViewerParamsMessage(std::string payload, std::string statusOnSuccess) {
+    if (payload.empty()) return;
+    {
+      std::lock_guard<std::mutex> lock(cubeViewerIoMutex_);
+      cubeViewerPendingParamsJson_ = std::move(payload);
+      cubeViewerPendingParamsStatus_ = std::move(statusOnSuccess);
+      cubeViewerPendingParams_ = true;
+    }
+    cubeViewerIoCv_.notify_one();
+  }
+
+  void queueCubeViewerInputCloudPayload(const CachedCubeViewerInputCloud& payload, const char* reason) {
+    if (!payload.valid || payload.points.empty()) return;
+    {
+      std::lock_guard<std::mutex> lock(cubeViewerIoMutex_);
+      cubeViewerPendingCloudPayload_ = payload;
+      cubeViewerPendingCloudReason_ = reason ? reason : "";
+      cubeViewerPendingCloud_ = true;
+    }
+    cubeViewerIoCv_.notify_one();
+  }
+
   bool cubeViewerRuntimeActiveForStreaming() const {
     if (!cubeViewerRequested_) return false;
     if (!cubeViewerLive_) return false;
@@ -4117,46 +4231,10 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
   }
 
   // Render-thread viewer liveness probe: keeps streaming gate/state up to date during playback.
-void refreshCubeViewerRuntimeStateRenderSafe() {
-    if (!cubeViewerRequested_) return;
-    const auto now = std::chrono::steady_clock::now();
-    if (cubeViewerLastRenderProbeAt_ != std::chrono::steady_clock::time_point::min()) {
-      const auto elapsedMs =
-          std::chrono::duration_cast<std::chrono::milliseconds>(now - cubeViewerLastRenderProbeAt_).count();
-      if (elapsedMs < 200) return;
-    }
-    cubeViewerLastRenderProbeAt_ = now;
-    int active = 1;
-    int visible = 1;
-    int minimized = 0;
-    int focused = 1;
-    // Render-thread probe is intentionally short and non-blocking-ish.
-    // If it misses, keep prior state and let UI heartbeat decide disconnect.
-    if (sendCubeViewerHeartbeatProbe(&active, &visible, &minimized, &focused, 2)) {
-      cubeViewerRenderProbeFailCount_ = 0;
-      cubeViewerConnected_ = true;
-      cubeViewerWindowUsable_ = (active != 0 && visible != 0 && minimized == 0);
-      cubeViewerLastStateVisible_ = (visible != 0);
-      cubeViewerLastStateMinimized_ = (minimized != 0);
-      cubeViewerLastStateFocused_ = (focused != 0);
-      if (!cubeViewerWindowUsable_) {
-        setCubeViewerStatusLabel("Connected (idle)");
-      } else if (cubeViewerStatusCache_ == "Disconnected" || cubeViewerStatusCache_.find("failed") != std::string::npos ||
-                 cubeViewerStatusCache_ == "Connected (idle)") {
-        setCubeViewerStatusLabel("Connected");
-      }
-    } else {
-      ++cubeViewerRenderProbeFailCount_;
-      // Stop heavy cloud processing immediately when runtime probe fails.
-      cubeViewerWindowUsable_ = false;
-      if (cubeViewerRenderProbeFailCount_ >= 2) {
-        cubeViewerConnected_ = false;
-        cubeViewerLastStateVisible_ = false;
-        cubeViewerLastStateMinimized_ = false;
-        cubeViewerLastStateFocused_ = false;
-        setCubeViewerStatusLabel("Disconnected");
-      }
-    }
+ void refreshCubeViewerRuntimeStateRenderSafe() {
+    // Stability-first: never perform viewer socket heartbeat probes on the render thread.
+    // UI/status monitoring keeps connection state fresh on its own thread.
+    return;
   }
 
   // UI-thread heartbeat: keeps status label truthful and detects stale/disconnected viewer sessions.
@@ -4460,32 +4538,8 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
     if (!payload.valid || payload.points.empty()) return false;
     noteCubeViewerInputCloudAttempt();
     const std::string json = buildCubeViewerInputCloudJson(payload);
-    if (debugLogEnabled()) {
-      std::fprintf(
-          stderr,
-          "[ME_OpenDRT] Cube input cloud send (%s): payload=%zu bytes quality=%s res=%d pending=%d\n",
-          reason ? reason : "unspecified",
-          json.size(),
-          payload.quality.c_str(),
-          payload.resolution,
-          cubeViewerInputCloudRefreshPending_ ? 1 : 0);
-    }
-
-    if (sendCubeViewerMessage(json)) {
-      cubeViewerConnected_ = true;
-      cubeViewerWindowUsable_ = true;
-      cubeViewerInputCloudRefreshPending_ = false;
-      setCubeViewerStatusLabel("Updating");
-      return true;
-    }
-
-    if (debugLogEnabled()) {
-      std::fprintf(stderr, "[ME_OpenDRT] Cube input cloud send failed (%s).\n", reason ? reason : "unspecified");
-    }
-    cubeViewerConnected_ = false;
-    cubeViewerWindowUsable_ = false;
-    setCubeViewerStatusLabel("Disconnected");
-    return false;
+    queueCubeViewerInputCloudPayload(payload, reason);
+    return true;
   }
 
   bool trySendCachedCubeViewerInputCloud(double time, const char* reason) {
@@ -4535,15 +4589,7 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
 void pushCubeViewerUpdate(double time, const std::string& changedParam, bool forceSnapshot = false) {
     if (!shouldEmitCubeViewerUpdate(forceSnapshot, changedParam, time)) return;
     const std::string payload = buildCubeViewerParamsJson(time, !forceSnapshot, changedParam);
-    if (sendCubeViewerMessage(payload) || (connectCubeViewerWithRetry(2, 20) && sendCubeViewerMessage(payload))) {
-      cubeViewerConnected_ = true;
-      cubeViewerWindowUsable_ = true;
-      setCubeViewerStatusLabel(forceSnapshot ? "Connected" : "Updating");
-    } else {
-      cubeViewerConnected_ = false;
-      cubeViewerWindowUsable_ = false;
-      setCubeViewerStatusLabel("Disconnected");
-    }
+    queueCubeViewerParamsMessage(payload, forceSnapshot ? "Connected" : "Updating");
   }
 
   bool connectCubeViewerWithRetry(int attempts, int sleepMs) {
@@ -4775,6 +4821,17 @@ void closeCubeViewerSession() {
   std::thread cubeViewerStatusMonitorThread_;
   std::atomic<bool> cubeViewerStatusMonitorStop_{false};
   std::atomic<bool> cubeViewerStatusMonitorRunning_{false};
+  std::thread cubeViewerIoThread_;
+  std::atomic<bool> cubeViewerIoStop_{false};
+  std::atomic<bool> cubeViewerIoRunning_{false};
+  std::mutex cubeViewerIoMutex_;
+  std::condition_variable cubeViewerIoCv_;
+  bool cubeViewerPendingParams_ = false;
+  std::string cubeViewerPendingParamsJson_;
+  std::string cubeViewerPendingParamsStatus_;
+  bool cubeViewerPendingCloud_ = false;
+  CachedCubeViewerInputCloud cubeViewerPendingCloudPayload_{};
+  std::string cubeViewerPendingCloudReason_;
   bool allowUiParamWrites_ = true;
   std::string cubeViewerLastParam_;
   std::chrono::steady_clock::time_point cubeViewerLastSendAt_ = std::chrono::steady_clock::time_point::min();
