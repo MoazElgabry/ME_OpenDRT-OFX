@@ -82,6 +82,8 @@ void logViewerEvent(const std::string& msg) {
 #endif
 }
 
+const char* kViewerVersionString = "v1.2.7";
+
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {
   if (fd < 0 || data == nullptr) return false;
@@ -1002,7 +1004,7 @@ int runApp() {
 #endif
     return 1;
   }
-  logViewerEvent("Viewer startup ok");
+  logViewerEvent(std::string("Viewer startup ok ") + kViewerVersionString);
 
   glfwMakeContextCurrent(window);
   glfwSwapInterval(1);
@@ -1073,6 +1075,7 @@ int runApp() {
     }
     if (haveParams) {
       ResolvedPayload rp{};
+      try {
         if (parseParamsMessage(pendingParams.line, &rp)) {
           if (!rp.senderId.empty() && rp.senderId != app.currentSenderId) {
             app.currentSenderId = rp.senderId;
@@ -1080,64 +1083,75 @@ int runApp() {
             lastCloudSeq = 0;
             hasDeferredCloud = false;
           }
-        if (rp.seq < lastParamsSeq) {
-          // Ignore stale param snapshots/deltas within the params stream.
-        } else {
-          lastParamsSeq = rp.seq;
-          const std::string prevSourceMode = app.currentSourceMode;
-          app.keepOnTop = (rp.alwaysOnTop != 0);
-          app.currentSourceMode = rp.sourceMode;
-          if (app.currentSourceMode != "input") {
-            MeshData nextMesh{};
-            buildCubeData(rp, &nextMesh);
-            mesh = std::move(nextMesh);
+          if (rp.seq < lastParamsSeq) {
+            // Ignore stale param snapshots/deltas within the params stream.
           } else {
-            // Keep last displayed mesh until an input_cloud payload arrives.
-            // This avoids flicker/blank frames on mode switch and live param deltas.
-            mesh.quality = rp.quality;
-            mesh.resolution = rp.resolution;
-            mesh.paramHash = rp.paramHash;
-            mesh.renderOk = true;
-            mesh.maxDelta = 0.0f;
-            if (prevSourceMode != "input") {
-              // Reset pan only when switching modes so stale framing does not hide the cloud.
-              app.cam.panX = 0.0f;
-              app.cam.panY = 0.0f;
-            }
-            if (hasDeferredCloud && deferredCloud.seq >= lastCloudSeq &&
-                senderMatchesCurrent(app.currentSenderId, deferredCloud.senderId)) {
+            lastParamsSeq = rp.seq;
+            const std::string prevSourceMode = app.currentSourceMode;
+            app.keepOnTop = (rp.alwaysOnTop != 0);
+            app.currentSourceMode = rp.sourceMode;
+            if (app.currentSourceMode != "input") {
               MeshData nextMesh{};
-              if (buildInputCloudMesh(deferredCloud, &nextMesh)) {
-                mesh = std::move(nextMesh);
-                lastCloudSeq = deferredCloud.seq;
-                hasDeferredCloud = false;
-                logViewerEvent("Applied deferred input cloud after params switched to input mode.");
+              buildCubeData(rp, &nextMesh);
+              mesh = std::move(nextMesh);
+            } else {
+              // Keep last displayed mesh until an input_cloud payload arrives.
+              // This avoids flicker/blank frames on mode switch and live param deltas.
+              mesh.quality = rp.quality;
+              mesh.resolution = rp.resolution;
+              mesh.paramHash = rp.paramHash;
+              mesh.renderOk = true;
+              mesh.maxDelta = 0.0f;
+              if (prevSourceMode != "input") {
+                // Reset pan only when switching modes so stale framing does not hide the cloud.
+                app.cam.panX = 0.0f;
+                app.cam.panY = 0.0f;
+              }
+              if (hasDeferredCloud && deferredCloud.seq >= lastCloudSeq &&
+                  senderMatchesCurrent(app.currentSenderId, deferredCloud.senderId)) {
+                MeshData nextMesh{};
+                if (buildInputCloudMesh(deferredCloud, &nextMesh)) {
+                  mesh = std::move(nextMesh);
+                  lastCloudSeq = deferredCloud.seq;
+                  hasDeferredCloud = false;
+                  logViewerEvent("Applied deferred input cloud after params switched to input mode.");
+                }
               }
             }
           }
         }
+      } catch (const std::exception& e) {
+        logViewerEvent(std::string("Exception while processing params message: ") + e.what());
+      } catch (...) {
+        logViewerEvent("Unknown exception while processing params message.");
       }
     }
     if (haveCloud) {
       InputCloudPayload cp{};
-      if (parseInputCloudMessage(pendingCloud.line, &cp)) {
-        if (!senderMatchesCurrent(app.currentSenderId, cp.senderId)) {
-          // Ignore clouds from a different OFX instance than the active sender.
-          logViewerEvent("Ignored input cloud from non-active sender.");
-        } else if (cp.seq < lastCloudSeq) {
-          logViewerEvent("Ignored stale input cloud sequence.");
-        } else if (app.currentSourceMode != "input") {
-          deferredCloud = cp;
-          hasDeferredCloud = true;
-          logViewerEvent("Deferred input cloud until params confirm input mode.");
-        } else {
-          MeshData nextMesh{};
-          if (buildInputCloudMesh(cp, &nextMesh)) {
-            mesh = std::move(nextMesh);
-            lastCloudSeq = cp.seq;
-            hasDeferredCloud = false;
+      try {
+        if (parseInputCloudMessage(pendingCloud.line, &cp)) {
+          if (!senderMatchesCurrent(app.currentSenderId, cp.senderId)) {
+            // Ignore clouds from a different OFX instance than the active sender.
+            logViewerEvent("Ignored input cloud from non-active sender.");
+          } else if (cp.seq < lastCloudSeq) {
+            logViewerEvent("Ignored stale input cloud sequence.");
+          } else if (app.currentSourceMode != "input") {
+            deferredCloud = cp;
+            hasDeferredCloud = true;
+            logViewerEvent("Deferred input cloud until params confirm input mode.");
+          } else {
+            MeshData nextMesh{};
+            if (buildInputCloudMesh(cp, &nextMesh)) {
+              mesh = std::move(nextMesh);
+              lastCloudSeq = cp.seq;
+              hasDeferredCloud = false;
+            }
           }
         }
+      } catch (const std::exception& e) {
+        logViewerEvent(std::string("Exception while processing input cloud message: ") + e.what());
+      } catch (...) {
+        logViewerEvent("Unknown exception while processing input cloud message.");
       }
     }
 

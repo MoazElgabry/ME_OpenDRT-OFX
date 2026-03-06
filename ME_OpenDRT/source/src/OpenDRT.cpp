@@ -187,6 +187,8 @@ void cubeViewerDebugLog(const std::string& line) {
   appendMacDebugLogLine(std::string("[ME_OpenDRT][CubeViewer] ") + line);
 }
 
+const char* kOfxVersionString = "v1.2.7";
+
 void cubeViewerDebugLogGate(const std::string& line) {
   static std::atomic<unsigned long long> counter{0};
   const unsigned long long n = ++counter;
@@ -2125,6 +2127,9 @@ class OpenDRTEffect : public OFX::ImageEffect {
     cubeViewerQuality_ = getChoice("cubeViewerQuality", 0.0, 0);
     setBool("cubeViewerIdentity", getChoice("cubeViewerSource", 0.0, 0) == 0 ? 1 : 0);
     setCubeViewerStatusLabel("Disconnected");
+    if (debugLogEnabled()) {
+      cubeViewerDebugLog(std::string("Initialized build ") + kOfxVersionString);
+    }
     startCubeViewerStatusMonitor();
   }
 
@@ -2288,8 +2293,14 @@ void render(const OFX::RenderArguments& args) override {
               if (eSrc == cudaSuccess && eDst == cudaSuccess) {
                   const cudaError_t eSync = cudaStreamSynchronize(hostStream);
                 if (eSync == cudaSuccess) {
-                  (void)emitCubeViewerInputCloud(
-                      srcStage, cloudRowBytes, dstStage, cloudRowBytes, width, height);
+                  try {
+                    (void)emitCubeViewerInputCloud(
+                        srcStage, cloudRowBytes, dstStage, cloudRowBytes, width, height);
+                  } catch (const std::exception& e) {
+                    cubeViewerDebugLog(std::string("CUDA input cloud emit threw: ") + e.what());
+                  } catch (...) {
+                    cubeViewerDebugLog("CUDA input cloud emit threw unknown exception.");
+                  }
                 } else if (debugLogEnabled()) {
                   std::fprintf(stderr, "[ME_OpenDRT] Cube input cloud CUDA sync failed: %s\n", cudaGetErrorString(eSync));
                 }
@@ -2433,8 +2444,14 @@ void render(const OFX::RenderArguments& args) override {
     }
 
     if (rendered && (wantHighQualityInputCloud || bypassCloudQualityGate)) {
-      (void)pushCubeViewerInputCloud(
-          args.time, renderedSrcBase, renderedSrcPitch, renderedDstBase, renderedDstPitch, width, height);
+      try {
+        (void)pushCubeViewerInputCloud(
+            args.time, renderedSrcBase, renderedSrcPitch, renderedDstBase, renderedDstPitch, width, height);
+      } catch (const std::exception& e) {
+        cubeViewerDebugLog(std::string("Host input cloud push threw: ") + e.what());
+      } catch (...) {
+        cubeViewerDebugLog("Host input cloud push threw unknown exception.");
+      }
     }
 
     perfLog("Render total", tRenderStart);
@@ -4683,7 +4700,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   // ===== Plugin Descriptor =====
   // Host capability advertisement and static metadata.
   void describe(OFX::ImageEffectDescriptor& d) override {
-      static const std::string nameWithVersion = "ME_OpenDRT v1.2.6";
+      static const std::string nameWithVersion = "ME_OpenDRT v1.2.7";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -5072,7 +5089,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
     supportOfxVersion->setLabel("OFX version");
-    supportOfxVersion->setDefault("v1.2.6");
+    supportOfxVersion->setDefault("v1.2.7");
     supportOfxVersion->setEnabled(false);
     supportOfxVersion->setParent(*grpSupportRoot);
     pSupport->addChild(*supportOfxVersion);
