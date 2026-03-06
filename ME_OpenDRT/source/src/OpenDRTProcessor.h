@@ -414,6 +414,41 @@ class OpenDRTProcessor {
     perfLogStage("Metal host render", t0);
     return ok;
   }
+
+  bool renderMetalHostBuffersReadback(
+      const void* srcMetalBuffer,
+      void* dstMetalBuffer,
+      int width,
+      int height,
+      size_t srcRowBytes,
+      size_t dstRowBytes,
+      int originX,
+      int originY,
+      void* metalCommandQueue,
+      float* readbackSrc,
+      size_t readbackSrcRowBytes,
+      float* readbackDst,
+      size_t readbackDstRowBytes) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = OpenDRTMetal::renderHostReadback(
+        srcMetalBuffer,
+        dstMetalBuffer,
+        width,
+        height,
+        srcRowBytes,
+        dstRowBytes,
+        originX,
+        originY,
+        params_,
+        derived_,
+        metalCommandQueue,
+        readbackSrc,
+        readbackSrcRowBytes,
+        readbackDst,
+        readbackDstRowBytes);
+    perfLogStage("Metal host render", t0);
+    return ok;
+  }
 #endif
 
   // OpenCL path for non-CUDA systems (primarily AMD/Intel GPUs on Windows).

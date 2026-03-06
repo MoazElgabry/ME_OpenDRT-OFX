@@ -2330,8 +2330,20 @@ void render(const OFX::RenderArguments& args) override {
       const size_t srcRowBytes = srcRb < 0 ? static_cast<size_t>(-srcRb) : static_cast<size_t>(srcRb);
       const size_t dstRowBytes = dstRb < 0 ? static_cast<size_t>(-dstRb) : static_cast<size_t>(dstRb);
       bool hostMetalRendered = false;
-      if (srcMetalBuffer != nullptr && dstMetalBuffer != nullptr &&
-          processor_->renderMetalHostBuffers(
+      const bool needHostMetalReadback = needFirstCloudHandoff || canUpdateInputCloudCache;
+      if (srcMetalBuffer != nullptr && dstMetalBuffer != nullptr) {
+        if (needHostMetalReadback) {
+          const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+          if (!ensureStageBuffers(pixelCount)) {
+            OFX::throwSuiteStatusException(kOfxStatFailed);
+          }
+          float* srcStage = stageSrcPtr();
+          float* dstStage = stageDstPtr();
+          if (srcStage == nullptr || dstStage == nullptr) {
+            OFX::throwSuiteStatusException(kOfxStatFailed);
+          }
+          const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+          hostMetalRendered = processor_->renderMetalHostBuffersReadback(
               srcMetalBuffer,
               dstMetalBuffer,
               width,
@@ -2339,48 +2351,49 @@ void render(const OFX::RenderArguments& args) override {
               srcRowBytes,
               dstRowBytes,
               bounds.x1,
-               bounds.y1,
-               args.pMetalCmdQ)) {
-        hostMetalRendered = true;
-        OpenDRTMetal::resetHostMetalFailureState();
-        // Stability-first cloud handoff:
-        // Reuse the already-rendered host-Metal frame when the host also exposes
-        // readable row pointers. This avoids the earlier crashy rerender/fallback
-        // path while still allowing cache population and one-shot handoff.
-        const bool canCaptureFromHostMetal =
-            srcLayout.valid && dstLayout.valid &&
-            ((needFirstCloudHandoff && cubeViewerRequested_ && cubeViewerLive_) || canUpdateInputCloudCache);
-        if (canCaptureFromHostMetal) {
-          CachedCubeViewerInputCloud cloudPayload{};
-          if (buildCubeViewerInputCloudPayload(
-                  args.time,
-                  srcLayout.base,
-                  srcLayout.pitchBytes,
-                  dstLayout.base,
-                  dstLayout.pitchBytes,
-                  width,
-                  height,
-                  &cloudPayload)) {
-            if (needFirstCloudHandoff || canUpdateInputCloudCache) {
-              maybeCaptureCubeViewerInputCloudCache(cloudPayload);
+              bounds.y1,
+              args.pMetalCmdQ,
+              srcStage,
+              packedRowBytes,
+              dstStage,
+              packedRowBytes);
+          if (hostMetalRendered) {
+            OpenDRTMetal::resetHostMetalFailureState();
+            CachedCubeViewerInputCloud cloudPayload{};
+            if (buildCubeViewerInputCloudPayload(
+                    args.time, srcStage, packedRowBytes, dstStage, packedRowBytes, width, height, &cloudPayload)) {
+              if (needFirstCloudHandoff || canUpdateInputCloudCache) {
+                maybeCaptureCubeViewerInputCloudCache(cloudPayload);
+              }
+              if (needFirstCloudHandoff || needSteadyStateCloud) {
+                (void)sendCubeViewerInputCloudPayload(
+                    cloudPayload,
+                    false,
+                    needFirstCloudHandoff ? "first-handoff/host-metal-readback" : "steady-state/host-metal-readback");
+              }
+            } else if (debugLogEnabled()) {
+              std::fprintf(stderr, "[ME_OpenDRT] Cube input cloud build failed after explicit host-Metal readback.\n");
             }
-            if (needFirstCloudHandoff || needSteadyStateCloud) {
-              (void)sendCubeViewerInputCloudPayload(
-                  cloudPayload,
-                  false,
-                  needFirstCloudHandoff ? "first-handoff/host-metal" : "steady-state/host-metal");
-            }
-          } else if (debugLogEnabled()) {
-            std::fprintf(stderr, "[ME_OpenDRT] Cube input cloud build failed on host-Metal frame.\n");
+            perfLog("Backend render host Metal", tHostMetal);
+            perfLog("Render total", tRenderStart);
+            return;
           }
-        } else if (needFirstCloudHandoff && debugLogEnabled()) {
-          std::fprintf(
-              stderr,
-              "[ME_OpenDRT] Host-Metal handoff pending but host-readable layout unavailable.\n");
+        } else if (processor_->renderMetalHostBuffers(
+                       srcMetalBuffer,
+                       dstMetalBuffer,
+                       width,
+                       height,
+                       srcRowBytes,
+                       dstRowBytes,
+                       bounds.x1,
+                       bounds.y1,
+                       args.pMetalCmdQ)) {
+          hostMetalRendered = true;
+          OpenDRTMetal::resetHostMetalFailureState();
+          perfLog("Backend render host Metal", tHostMetal);
+          perfLog("Render total", tRenderStart);
+          return;
         }
-        perfLog("Backend render host Metal", tHostMetal);
-        perfLog("Render total", tRenderStart);
-        return;
       }
       if (!hostMetalRendered && debugLogEnabled()) {
         std::fprintf(stderr, "[ME_OpenDRT] Host Metal render failed.\n");

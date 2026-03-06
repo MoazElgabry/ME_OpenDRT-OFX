@@ -42,6 +42,10 @@ struct ThreadBuffers {
   size_t hostTempSrcBytes = 0;
   id<MTLBuffer> hostTempDstBuffer = nil;
   size_t hostTempDstBytes = 0;
+  id<MTLBuffer> hostReadbackSrcBuffer = nil;
+  size_t hostReadbackSrcBytes = 0;
+  id<MTLBuffer> hostReadbackDstBuffer = nil;
+  size_t hostReadbackDstBytes = 0;
 };
 
 MetalContext& context() {
@@ -228,6 +232,28 @@ void perfLogStage(const char* stage, const std::chrono::steady_clock::time_point
       std::fprintf(f, "[ME_OpenDRT][PERF][Metal] %s: %.3f ms\n", stage, ms);
       std::fclose(f);
     }
+  }
+}
+
+void copyBufferToHostRows(
+    id<MTLBuffer> srcBuffer,
+    size_t srcOffsetBytes,
+    size_t srcRowBytes,
+    float* dst,
+    size_t dstRowBytes,
+    int width,
+    int height) {
+  if (srcBuffer == nil || dst == nullptr || width <= 0 || height <= 0) return;
+  const char* srcBase = static_cast<const char*>([srcBuffer contents]);
+  if (srcBase == nullptr) return;
+  const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+  const char* srcStart = srcBase + srcOffsetBytes;
+  char* dstStart = reinterpret_cast<char*>(dst);
+  for (int y = 0; y < height; ++y) {
+    std::memcpy(
+        dstStart + static_cast<size_t>(y) * dstRowBytes,
+        srcStart + static_cast<size_t>(y) * srcRowBytes,
+        packedRowBytes);
   }
 }
 
@@ -778,6 +804,266 @@ bool renderHost(
       return false;
     }
   }
+
+  perfLogStage("Metal host total", tStart);
+  return true;
+}
+
+bool renderHostReadback(
+    const void* srcMetalBuffer,
+    void* dstMetalBuffer,
+    int width,
+    int height,
+    size_t srcRowBytes,
+    size_t dstRowBytes,
+    int originX,
+    int originY,
+    const OpenDRTParams& params,
+    const OpenDRTDerivedParams& derived,
+    void* metalCommandQueue,
+    float* readbackSrc,
+    size_t readbackSrcRowBytes,
+    float* readbackDst,
+    size_t readbackDstRowBytes) {
+  const auto tStart = std::chrono::steady_clock::now();
+  if (srcMetalBuffer == nullptr || dstMetalBuffer == nullptr || metalCommandQueue == nullptr || width <= 0 || height <= 0) {
+    return false;
+  }
+  if (readbackSrc == nullptr || readbackDst == nullptr) return false;
+
+  id<MTLCommandQueue> hostQueue = (id<MTLCommandQueue>)metalCommandQueue;
+  if (hostQueue == nil) return false;
+  auto& ctx = context();
+  if (ctx.hostTemporarilyDisabled.load(std::memory_order_relaxed)) {
+    debugLog("Host Metal readback path temporarily disabled due to prior async errors.");
+    return false;
+  }
+  if (!ctx.initialized) {
+    debugLog("Host Metal readback requested before Metal context initialization.");
+    return false;
+  }
+
+  id<MTLBuffer> srcBuffer = (id<MTLBuffer>)srcMetalBuffer;
+  id<MTLBuffer> dstBuffer = (id<MTLBuffer>)dstMetalBuffer;
+  if (srcBuffer == nil || dstBuffer == nil) return false;
+
+  const size_t pixelBytes = 4u * sizeof(float);
+  const size_t requiredSrcBytes = static_cast<size_t>(height) * srcRowBytes;
+  const size_t requiredDstBytes = static_cast<size_t>(height) * dstRowBytes;
+  size_t srcOffsetBytes = 0;
+  size_t dstOffsetBytes = 0;
+  size_t srcCandidateOffset = 0;
+  size_t dstCandidateOffset = 0;
+  const bool hasOriginOffset = (originX != 0 || originY != 0);
+  bool canUseOffset = false;
+  const bool canUseZero = (srcBuffer.length >= requiredSrcBytes && dstBuffer.length >= requiredDstBytes);
+  if (hasOriginOffset) {
+    const size_t ox = static_cast<size_t>(originX);
+    const size_t oy = static_cast<size_t>(originY);
+    srcCandidateOffset = oy * srcRowBytes + ox * pixelBytes;
+    dstCandidateOffset = oy * dstRowBytes + ox * pixelBytes;
+    canUseOffset =
+        (srcBuffer.length >= srcCandidateOffset + requiredSrcBytes && dstBuffer.length >= dstCandidateOffset + requiredDstBytes);
+  }
+
+  const bool ambiguousOffset = hasOriginOffset && canUseZero && canUseOffset;
+  const HostOffsetMode offsetMode = hostOffsetMode();
+  switch (offsetMode) {
+    case HostOffsetMode::Zero:
+      if (!canUseZero) return false;
+      break;
+    case HostOffsetMode::Origin:
+      if (!canUseOffset) return false;
+      srcOffsetBytes = srcCandidateOffset;
+      dstOffsetBytes = dstCandidateOffset;
+      break;
+    case HostOffsetMode::FallbackAmbiguous:
+      if (ambiguousOffset) return false;
+      if (canUseOffset) {
+        srcOffsetBytes = srcCandidateOffset;
+        dstOffsetBytes = dstCandidateOffset;
+      } else if (!canUseZero) {
+        return false;
+      }
+      break;
+    case HostOffsetMode::Auto:
+    default:
+      if (canUseOffset && (!canUseZero || hasOriginOffset)) {
+        srcOffsetBytes = srcCandidateOffset;
+        dstOffsetBytes = dstCandidateOffset;
+      } else if (!canUseZero) {
+        return false;
+      }
+      break;
+  }
+
+  if (srcBuffer.length < srcOffsetBytes + requiredSrcBytes || dstBuffer.length < dstOffsetBytes + requiredDstBytes) {
+    return false;
+  }
+
+  auto& buffers = threadBuffers();
+  id<MTLBuffer> kernelSrcBuffer = srcBuffer;
+  size_t kernelSrcOffset = srcOffsetBytes;
+  id<MTLBuffer> kernelDstBuffer = dstBuffer;
+  size_t kernelDstOffset = dstOffsetBytes;
+
+  const bool sameBuffer = (srcBuffer == dstBuffer);
+  const size_t srcBegin = srcOffsetBytes;
+  const size_t srcEnd = srcOffsetBytes + requiredSrcBytes;
+  const size_t dstBegin = dstOffsetBytes;
+  const size_t dstEnd = dstOffsetBytes + requiredDstBytes;
+  const bool overlappingRanges = sameBuffer && (srcBegin < dstEnd) && (dstBegin < srcEnd);
+  const bool needsAliasProtection = overlappingRanges && (srcOffsetBytes != dstOffsetBytes || srcRowBytes != dstRowBytes);
+  if (needsAliasProtection) {
+    if (buffers.hostTempSrcBuffer == nil || buffers.hostTempSrcBytes < requiredSrcBytes) {
+      buffers.hostTempSrcBuffer = [ctx.device newBufferWithLength:requiredSrcBytes options:MTLResourceStorageModeShared];
+      buffers.hostTempSrcBytes = (buffers.hostTempSrcBuffer != nil) ? requiredSrcBytes : 0;
+    }
+    if (buffers.hostTempSrcBuffer == nil) {
+      debugLog("Failed to allocate host temp src buffer for readback alias protection.");
+      return false;
+    }
+    kernelSrcBuffer = buffers.hostTempSrcBuffer;
+    kernelSrcOffset = 0;
+  }
+  if (useHostIntermediateDst()) {
+    if (buffers.hostTempDstBuffer == nil || buffers.hostTempDstBytes < requiredDstBytes) {
+      buffers.hostTempDstBuffer = [ctx.device newBufferWithLength:requiredDstBytes options:MTLResourceStorageModeShared];
+      buffers.hostTempDstBytes = (buffers.hostTempDstBuffer != nil) ? requiredDstBytes : 0;
+    }
+    if (buffers.hostTempDstBuffer == nil) {
+      debugLog("Failed to allocate host temp dst buffer for readback.");
+      return false;
+    }
+    kernelDstBuffer = buffers.hostTempDstBuffer;
+    kernelDstOffset = 0;
+  }
+
+  if (buffers.hostReadbackSrcBuffer == nil || buffers.hostReadbackSrcBytes < requiredSrcBytes) {
+    buffers.hostReadbackSrcBuffer = [ctx.device newBufferWithLength:requiredSrcBytes options:MTLResourceStorageModeShared];
+    buffers.hostReadbackSrcBytes = (buffers.hostReadbackSrcBuffer != nil) ? requiredSrcBytes : 0;
+  }
+  if (buffers.hostReadbackDstBuffer == nil || buffers.hostReadbackDstBytes < requiredDstBytes) {
+    buffers.hostReadbackDstBuffer = [ctx.device newBufferWithLength:requiredDstBytes options:MTLResourceStorageModeShared];
+    buffers.hostReadbackDstBytes = (buffers.hostReadbackDstBuffer != nil) ? requiredDstBytes : 0;
+  }
+  if (buffers.hostReadbackSrcBuffer == nil || buffers.hostReadbackDstBuffer == nil) {
+    debugLog("Failed to allocate host Metal readback buffers.");
+    return false;
+  }
+
+  const int srcRowFloats = static_cast<int>(srcRowBytes / sizeof(float));
+  const int dstRowFloats = static_cast<int>(dstRowBytes / sizeof(float));
+
+  id<MTLCommandBuffer> cmd = [hostQueue commandBuffer];
+  if (cmd == nil) {
+    debugLog("Failed to create host Metal readback command buffer.");
+    return false;
+  }
+
+  if (needsAliasProtection) {
+    id<MTLBlitCommandEncoder> preBlit = [cmd blitCommandEncoder];
+    if (preBlit == nil) {
+      debugLog("Failed to create host Metal readback pre-blit encoder.");
+      return false;
+    }
+    [preBlit copyFromBuffer:srcBuffer sourceOffset:srcOffsetBytes toBuffer:kernelSrcBuffer destinationOffset:0 size:requiredSrcBytes];
+    [preBlit endEncoding];
+  }
+
+  id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+  if (enc == nil) {
+    debugLog("Failed to create host Metal readback compute encoder.");
+    return false;
+  }
+  [enc setComputePipelineState:ctx.pipeline];
+  [enc setBuffer:kernelSrcBuffer offset:kernelSrcOffset atIndex:0];
+  [enc setBuffer:kernelDstBuffer offset:kernelDstOffset atIndex:1];
+  [enc setBytes:&params length:sizeof(OpenDRTParams) atIndex:2];
+  [enc setBytes:&width length:sizeof(int) atIndex:3];
+  [enc setBytes:&height length:sizeof(int) atIndex:4];
+  [enc setBytes:&derived length:sizeof(OpenDRTDerivedParams) atIndex:5];
+  [enc setBytes:&srcRowFloats length:sizeof(int) atIndex:6];
+  [enc setBytes:&dstRowFloats length:sizeof(int) atIndex:7];
+
+  const NSUInteger maxThreads = ctx.pipeline.maxTotalThreadsPerThreadgroup;
+  const NSUInteger tew = ctx.pipeline.threadExecutionWidth;
+  NSUInteger tx = tew > 0 ? tew : 16;
+  if (tx > maxThreads) tx = maxThreads;
+  NSUInteger ty = maxThreads / tx;
+  if (ty == 0) ty = 1;
+  if (ty > 16) ty = 16;
+  const MTLSize threadsPerThreadgroup = MTLSizeMake(tx, ty, 1);
+  const MTLSize threadsPerGrid = MTLSizeMake(static_cast<NSUInteger>(width), static_cast<NSUInteger>(height), 1);
+  [enc dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+  [enc endEncoding];
+
+  id<MTLBuffer> finalDstBuffer = kernelDstBuffer;
+  size_t finalDstOffset = kernelDstOffset;
+  if (kernelDstBuffer != dstBuffer) {
+    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+    if (blit == nil) {
+      debugLog("Failed to create host Metal readback dst blit encoder.");
+      return false;
+    }
+    [blit copyFromBuffer:kernelDstBuffer
+            sourceOffset:0
+                toBuffer:dstBuffer
+       destinationOffset:dstOffsetBytes
+                    size:requiredDstBytes];
+    [blit endEncoding];
+    finalDstBuffer = kernelDstBuffer;
+    finalDstOffset = 0;
+  }
+
+  id<MTLBlitCommandEncoder> readbackBlit = [cmd blitCommandEncoder];
+  if (readbackBlit == nil) {
+    debugLog("Failed to create host Metal readback encoder.");
+    return false;
+  }
+  [readbackBlit copyFromBuffer:kernelSrcBuffer
+                  sourceOffset:kernelSrcOffset
+                      toBuffer:buffers.hostReadbackSrcBuffer
+             destinationOffset:0
+                          size:requiredSrcBytes];
+  [readbackBlit copyFromBuffer:finalDstBuffer
+                  sourceOffset:finalDstOffset
+                      toBuffer:buffers.hostReadbackDstBuffer
+             destinationOffset:0
+                          size:requiredDstBytes];
+  [readbackBlit endEncoding];
+
+  [cmd commit];
+  [cmd waitUntilCompleted];
+  if (cmd.status != MTLCommandBufferStatusCompleted) {
+    if (cmd.error != nil) {
+      NSLog(@"ME_OpenDRT Metal host readback failed: %@", cmd.error.localizedDescription);
+    }
+    debugLog("Host Metal readback command buffer failed.");
+    return false;
+  }
+
+  ctx.hostAsyncErrorCount.store(0, std::memory_order_relaxed);
+  if (metalDiagEnabled()) {
+    diagLog("sync-complete status=COMPLETED errors=0");
+  }
+
+  copyBufferToHostRows(
+      buffers.hostReadbackSrcBuffer,
+      0,
+      srcRowBytes,
+      readbackSrc,
+      readbackSrcRowBytes,
+      width,
+      height);
+  copyBufferToHostRows(
+      buffers.hostReadbackDstBuffer,
+      0,
+      dstRowBytes,
+      readbackDst,
+      readbackDstRowBytes,
+      width,
+      height);
 
   perfLogStage("Metal host total", tStart);
   return true;
