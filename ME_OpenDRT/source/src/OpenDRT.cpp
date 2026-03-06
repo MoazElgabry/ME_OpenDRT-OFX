@@ -2211,11 +2211,12 @@ void render(const OFX::RenderArguments& args) override {
         isHighQualityRenderForCloud(args);
     const bool needFirstCloudHandoff = shouldEmitCubeViewerInputCloudFirstHandoff(args.time);
     const bool needSteadyStateCloud = canUpdateInputCloudCache && shouldEmitCubeViewerInputCloudSteadyState(args.time);
-    const bool needHostReadableInputCloud = needFirstCloudHandoff || needSteadyStateCloud;
-    // Cloud extraction relies on host-readable image memory. Avoid rendering once via host Metal and then
-    // falling through into a second render on the same frame. For cloud-needed frames, bypass host Metal
-    // up front and let the existing host-readable path handle render + cloud extraction in one pass.
-    const bool bypassHostMetalForCubeViewerCloud = needHostReadableInputCloud;
+    // Stability-first:
+    // - first handoff should be satisfied from cached cloud delivery only
+    // - do not alter backend/render selection just because the user toggled identity off
+    // - only already-safe steady-state updates may request host-readable cloud extraction
+    const bool needHostReadableInputCloud = needSteadyStateCloud;
+    const bool bypassHostMetalForCubeViewerCloud = needSteadyStateCloud;
 
     if (!processor_) {
       processor_ = std::make_unique<OpenDRTProcessor>(params);
@@ -2278,11 +2279,11 @@ void render(const OFX::RenderArguments& args) override {
                     if (canUpdateInputCloudCache) {
                       maybeCaptureCubeViewerInputCloudCache(cloudPayload);
                     }
-                    if (needFirstCloudHandoff || needSteadyStateCloud) {
+                    if (needSteadyStateCloud) {
                       (void)sendCubeViewerInputCloudPayload(
                           cloudPayload,
-                          needFirstCloudHandoff,
-                          needFirstCloudHandoff ? "first-handoff/cuda-host" : "steady-state/cuda-host");
+                          false,
+                          "steady-state/cuda-host");
                     }
                   } else if (debugLogEnabled() && (needHostReadableInputCloud || canUpdateInputCloudCache)) {
                     std::fprintf(stderr, "[ME_OpenDRT] Cube input cloud build failed after CUDA host readback.\n");
@@ -2353,10 +2354,7 @@ void render(const OFX::RenderArguments& args) override {
       // This preserves stability if host-Metal submission fails transiently.
     }
     if (bypassHostMetalForCubeViewerCloud && debugLogEnabled()) {
-      std::fprintf(
-          stderr,
-          "[ME_OpenDRT] Bypassing host Metal for cube viewer cloud frame (%s).\n",
-          needFirstCloudHandoff ? "first handoff" : "steady-state");
+      std::fprintf(stderr, "[ME_OpenDRT] Bypassing host Metal for cube viewer cloud frame (steady-state).\n");
     }
 #endif
 
@@ -2442,11 +2440,11 @@ void render(const OFX::RenderArguments& args) override {
         if (canUpdateInputCloudCache) {
           maybeCaptureCubeViewerInputCloudCache(cloudPayload);
         }
-        if (needFirstCloudHandoff || needSteadyStateCloud) {
+        if (needSteadyStateCloud) {
           (void)sendCubeViewerInputCloudPayload(
               cloudPayload,
-              needFirstCloudHandoff,
-              needFirstCloudHandoff ? "first-handoff/render" : "steady-state/render");
+              false,
+              "steady-state/render");
         }
       } else if (debugLogEnabled()) {
         std::fprintf(stderr, "[ME_OpenDRT] Cube input cloud build failed on host-readable render path.\n");
