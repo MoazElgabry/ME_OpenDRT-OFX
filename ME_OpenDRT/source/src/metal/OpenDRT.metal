@@ -93,8 +93,8 @@ inline float safe_log_pos(float x, float eps) { return log(fmax(x, eps)); }
 inline float safe_log_pos(float x) { return safe_log_pos(x, 1e-6f); }
 inline float safe_log2_pos(float x, float eps) { return log2(fmax(x, eps)); }
 inline float safe_log2_pos(float x) { return safe_log2_pos(x, 1e-6f); }
-inline float safe_exp_clamped(float x) { return exp(clampf3(make_float3(x, x, x), -80.0f, 80.0f).x); }
-inline float safe_exp2_clamped(float x) { return exp2(clampf3(make_float3(x, x, x), -126.0f, 126.0f).x); }
+inline float safe_exp_clamped(float x) { return exp(clamp(x, -80.0f, 80.0f)); }
+inline float safe_exp2_clamped(float x) { return exp2(clamp(x, -126.0f, 126.0f)); }
 inline float safe_hypot2(float2 v) { return safe_sqrt(v.x * v.x + v.y * v.y); }
 inline float safe_hypot3(float3 v) { return safe_sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
 // atan/atan2 have been a backend-specific trouble spot before, especially near
