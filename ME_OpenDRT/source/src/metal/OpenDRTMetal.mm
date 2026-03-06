@@ -27,7 +27,6 @@ struct MetalContext {
   id<MTLDevice> device = nil;
   id<MTLCommandQueue> queue = nil;
   id<MTLComputePipelineState> pipeline = nil;
-  id<MTLComputePipelineState> copyPipeline = nil;
   std::mutex initMutex;
   std::atomic<int> hostAsyncErrorCount{0};
   std::atomic<bool> hostTemporarilyDisabled{false};
@@ -93,11 +92,6 @@ bool disableMetal2DCopy() {
 
 bool metalDiagEnabled() {
   static const bool enabled = envFlagEnabled("ME_OPENDRT_METAL_DIAG");
-  return enabled;
-}
-
-bool metalCopyOnlyEnabled() {
-  static const bool enabled = envFlagEnabled("ME_OPENDRT_METAL_COPY_ONLY");
   return enabled;
 }
 
@@ -286,8 +280,7 @@ bool initializePipelineForDevice(id<MTLDevice> device, id<MTLCommandQueue> defau
   }
 
   id<MTLFunction> function = [library newFunctionWithName:@"OpenDRTKernel"];
-  id<MTLFunction> copyFunction = [library newFunctionWithName:@"OpenDRTCopyKernel"];
-  if (function == nil || copyFunction == nil) {
+  if (function == nil) {
     NSArray<NSString*>* names = [library functionNames];
     if (names != nil && names.count > 0) {
       NSMutableString* joined = [NSMutableString string];
@@ -299,7 +292,7 @@ bool initializePipelineForDevice(id<MTLDevice> device, id<MTLCommandQueue> defau
     } else {
       NSLog(@"ME_OpenDRT Metal: metallib contains no discoverable functions");
     }
-    NSLog(@"ME_OpenDRT Metal: required kernel entry not found in metallib");
+    NSLog(@"ME_OpenDRT Metal: OpenDRTKernel entry not found in metallib");
     return false;
   }
 
@@ -307,13 +300,6 @@ bool initializePipelineForDevice(id<MTLDevice> device, id<MTLCommandQueue> defau
   if (ctx.pipeline == nil) {
     if (error != nil) {
       NSLog(@"ME_OpenDRT Metal: failed to create compute pipeline: %@", error.localizedDescription);
-    }
-    return false;
-  }
-  ctx.copyPipeline = [ctx.device newComputePipelineStateWithFunction:copyFunction error:&error];
-  if (ctx.copyPipeline == nil) {
-    if (error != nil) {
-      NSLog(@"ME_OpenDRT Metal: failed to create copy pipeline: %@", error.localizedDescription);
     }
     return false;
   }
@@ -339,7 +325,6 @@ bool initialize(id<MTLCommandQueue> preferredQueue = nil) {
     }
     // Host queue/device changed (or host uses different device): rebuild pipeline safely.
     ctx.pipeline = nil;
-    ctx.copyPipeline = nil;
     ctx.queue = nil;
     ctx.device = nil;
     ctx.initialized = false;
@@ -376,16 +361,6 @@ static bool renderImpl(
   auto& buffers = threadBuffers();
   const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u * sizeof(float);
   const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
-  if (srcRowBytes == 0) srcRowBytes = packedRowBytes;
-  if (dstRowBytes == 0) dstRowBytes = packedRowBytes;
-  if (srcRowBytes < packedRowBytes || dstRowBytes < packedRowBytes) {
-    debugLog("Internal Metal path rejected invalid rowBytes.");
-    return false;
-  }
-  if ((srcRowBytes % sizeof(float)) != 0 || (dstRowBytes % sizeof(float)) != 0) {
-    debugLog("Internal Metal path rejected non-float-aligned rowBytes.");
-    return false;
-  }
   const int packedRowFloats = width * 4;
   const bool packedSrc = (srcRowBytes == packedRowBytes);
   const bool packedDst = (dstRowBytes == packedRowBytes);
@@ -397,10 +372,6 @@ static bool renderImpl(
   }
   if (buffers.srcBuffer == nil || buffers.dstBuffer == nil) {
     debugLog("Thread-local Metal buffer allocation failed.");
-    return false;
-  }
-  if (buffers.srcBuffer.contents == nullptr || buffers.dstBuffer.contents == nullptr) {
-    debugLog("Thread-local Metal buffer contents unavailable.");
     return false;
   }
   if (packedSrc) {
@@ -428,12 +399,7 @@ static bool renderImpl(
     return false;
   }
 
-  id<MTLComputePipelineState> activePipeline = metalCopyOnlyEnabled() ? ctx.copyPipeline : ctx.pipeline;
-  if (activePipeline == nil) {
-    debugLog("Internal Metal active pipeline was nil.");
-    return false;
-  }
-  [enc setComputePipelineState:activePipeline];
+  [enc setComputePipelineState:ctx.pipeline];
   [enc setBuffer:buffers.srcBuffer offset:0 atIndex:0];
   [enc setBuffer:buffers.dstBuffer offset:0 atIndex:1];
   [enc setBytes:&params length:sizeof(OpenDRTParams) atIndex:2];
@@ -452,14 +418,14 @@ static bool renderImpl(
       if (std::sscanf(env, "%dx%d", &bx, &by) == 2 && bx > 0 && by > 0) {
         const NSUInteger ux = static_cast<NSUInteger>(bx);
         const NSUInteger uy = static_cast<NSUInteger>(by);
-        const NSUInteger maxThreads = activePipeline.maxTotalThreadsPerThreadgroup;
+        const NSUInteger maxThreads = ctx.pipeline.maxTotalThreadsPerThreadgroup;
         if (ux * uy <= maxThreads) {
           return MTLSizeMake(ux, uy, 1);
         }
       }
     }
-    const NSUInteger maxThreads = activePipeline.maxTotalThreadsPerThreadgroup;
-    const NSUInteger tew = activePipeline.threadExecutionWidth;
+    const NSUInteger maxThreads = ctx.pipeline.maxTotalThreadsPerThreadgroup;
+    const NSUInteger tew = ctx.pipeline.threadExecutionWidth;
     NSUInteger tx = tew > 0 ? tew : 16;
     if (tx > maxThreads) tx = maxThreads;
     NSUInteger ty = maxThreads / tx;
@@ -656,8 +622,7 @@ bool renderHost(
   if (metalDiagEnabled()) {
     std::ostringstream oss;
     oss << "offset-select srcOff=" << srcOffsetBytes << " dstOff=" << dstOffsetBytes
-        << " required=" << requiredSrcBytes << "/" << requiredDstBytes
-        << " copyOnly=" << (metalCopyOnlyEnabled() ? 1 : 0);
+        << " required=" << requiredSrcBytes << "/" << requiredDstBytes;
     diagLog(oss.str());
   }
 
@@ -729,12 +694,7 @@ bool renderHost(
     [preBlit endEncoding];
   }
 
-  id<MTLComputePipelineState> activePipeline = metalCopyOnlyEnabled() ? ctx.copyPipeline : ctx.pipeline;
-  if (activePipeline == nil) {
-    debugLog("Active Metal pipeline was nil.");
-    return false;
-  }
-  [enc setComputePipelineState:activePipeline];
+  [enc setComputePipelineState:ctx.pipeline];
   [enc setBuffer:kernelSrcBuffer offset:kernelSrcOffset atIndex:0];
   [enc setBuffer:kernelDstBuffer offset:kernelDstOffset atIndex:1];
   [enc setBytes:&params length:sizeof(OpenDRTParams) atIndex:2];
@@ -744,8 +704,8 @@ bool renderHost(
   [enc setBytes:&srcRowFloats length:sizeof(int) atIndex:6];
   [enc setBytes:&dstRowFloats length:sizeof(int) atIndex:7];
 
-  const NSUInteger maxThreads = activePipeline.maxTotalThreadsPerThreadgroup;
-  const NSUInteger tew = activePipeline.threadExecutionWidth;
+  const NSUInteger maxThreads = ctx.pipeline.maxTotalThreadsPerThreadgroup;
+  const NSUInteger tew = ctx.pipeline.threadExecutionWidth;
   NSUInteger tx = tew > 0 ? tew : 16;
   if (tx > maxThreads) tx = maxThreads;
   NSUInteger ty = maxThreads / tx;

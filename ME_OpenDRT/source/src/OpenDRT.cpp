@@ -76,15 +76,6 @@ bool forceStageCopyEnabled() {
   return enabled;
 }
 
-bool cubeViewerDisableHighQualityGateEnabled() {
-  static const bool enabled = []() {
-    const char* v = std::getenv("ME_OPENDRT_CUBE_VIEWER_DISABLE_HQ_GATE");
-    if (v == nullptr || v[0] == '\0') return false;
-    return !(v[0] == '0' && v[1] == '\0');
-  }();
-  return enabled;
-}
-
 enum class CudaRenderMode {
   HostPreferred,
   InternalOnly
@@ -179,22 +170,6 @@ void appendMacDebugLogLine(const std::string& line) {
 #else
   (void)line;
 #endif
-}
-
-void cubeViewerDebugLog(const std::string& line) {
-  if (!debugLogEnabled()) return;
-  std::fprintf(stderr, "[ME_OpenDRT][CubeViewer] %s\n", line.c_str());
-  appendMacDebugLogLine(std::string("[ME_OpenDRT][CubeViewer] ") + line);
-}
-
-const char* kOfxVersionString = "v1.2.8";
-
-void cubeViewerDebugLogGate(const std::string& line) {
-  static std::atomic<unsigned long long> counter{0};
-  const unsigned long long n = ++counter;
-  if (n <= 24ull || (n % 120ull) == 0ull) {
-    cubeViewerDebugLog(line);
-  }
 }
 
 // Perf logging writes to stderr and platform-local file locations to help compare host/internal paths.
@@ -475,23 +450,9 @@ bool sendCubeViewerMessage(const std::string& msg) {
 #ifdef MSG_NOSIGNAL
   sendFlags |= MSG_NOSIGNAL;
 #endif
-  size_t totalSent = 0;
-  while (totalSent < payload.size()) {
-    const ssize_t sent = ::send(fd, payload.data() + totalSent, payload.size() - totalSent, sendFlags);
-    if (sent <= 0) {
-      if (debugLogEnabled()) {
-        std::ostringstream os;
-        os << "sendCubeViewerMessage failed after " << totalSent << "/" << payload.size()
-           << " bytes, errno=" << errno << " (" << std::strerror(errno) << ")";
-        cubeViewerDebugLog(os.str());
-      }
-      ::close(fd);
-      return false;
-    }
-    totalSent += static_cast<size_t>(sent);
-  }
+  const ssize_t sent = ::send(fd, payload.data(), payload.size(), sendFlags);
   ::close(fd);
-  return true;
+  return sent == static_cast<ssize_t>(payload.size());
 #endif
 }
 
@@ -575,14 +536,10 @@ bool sendCubeViewerHeartbeatProbe(
     ::close(fd);
     return false;
   }
-  size_t totalSent = 0;
-  while (totalSent < payload.size()) {
-    const ssize_t sent = ::send(fd, payload.data() + totalSent, payload.size() - totalSent, 0);
-    if (sent <= 0) {
-      ::close(fd);
-      return false;
-    }
-    totalSent += static_cast<size_t>(sent);
+  const ssize_t sent = ::send(fd, payload.data(), payload.size(), 0);
+  if (sent != static_cast<ssize_t>(payload.size())) {
+    ::close(fd);
+    return false;
   }
   timeval tv{};
   if (timeoutMs < 1) timeoutMs = 1;
@@ -2127,9 +2084,6 @@ class OpenDRTEffect : public OFX::ImageEffect {
     cubeViewerQuality_ = getChoice("cubeViewerQuality", 0.0, 0);
     setBool("cubeViewerIdentity", getChoice("cubeViewerSource", 0.0, 0) == 0 ? 1 : 0);
     setCubeViewerStatusLabel("Disconnected");
-    if (debugLogEnabled()) {
-      cubeViewerDebugLog(std::string("Initialized build ") + kOfxVersionString);
-    }
     startCubeViewerStatusMonitor();
   }
 
@@ -2223,21 +2177,6 @@ void render(const OFX::RenderArguments& args) override {
     OpenDRTParams params = resolveParams(raw);
     perfLog("Param resolve", tResolveStart);
     const bool wantInputCloud = cubeViewerRequested_ && cubeViewerLive_ && (getBool("cubeViewerIdentity", args.time, 1) == 0);
-    const bool fullFrameForCloud = isFullFrameRenderWindow(bounds, args.renderWindow);
-    const bool highQualityForCloud = isHighQualityRenderForCloud(args);
-    const bool wantHighQualityInputCloud = wantInputCloud && fullFrameForCloud && highQualityForCloud;
-    const bool bypassCloudQualityGate = wantInputCloud && cubeViewerDisableHighQualityGateEnabled();
-    const bool allowInputCloudThisRender = wantHighQualityInputCloud;
-    if (wantInputCloud && !wantHighQualityInputCloud && debugLogEnabled()) {
-      std::ostringstream os;
-      os << "Input cloud gated: fullFrame=" << (fullFrameForCloud ? 1 : 0)
-         << " renderScale=" << args.renderScale.x << "x" << args.renderScale.y
-         << " draft=" << (args.renderQualityDraft ? 1 : 0)
-         << " bypass=" << (bypassCloudQualityGate ? 1 : 0)
-         << " renderWindow=(" << args.renderWindow.x1 << "," << args.renderWindow.y1 << ")-("
-         << args.renderWindow.x2 << "," << args.renderWindow.y2 << ")";
-      cubeViewerDebugLogGate(os.str());
-    }
 
     if (!processor_) {
       processor_ = std::make_unique<OpenDRTProcessor>(params);
@@ -2265,7 +2204,8 @@ void render(const OFX::RenderArguments& args) override {
       const size_t dstRowBytes = dstRb < 0 ? static_cast<size_t>(-dstRb) : static_cast<size_t>(dstRb);
       if (srcDevice != nullptr && dstDevice != nullptr &&
           processor_->renderCUDAHostBuffers(srcDevice, dstDevice, width, height, srcRowBytes, dstRowBytes, args.pCudaStream)) {
-        if (allowInputCloudThisRender && shouldEmitCubeViewerInputCloud(args.time)) {
+        if (wantInputCloud && isFullFrameRenderWindow(bounds, args.renderWindow) && isHighQualityRenderForCloud(args) &&
+            shouldEmitCubeViewerInputCloud(args.time)) {
           const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
           if (ensureStageBuffers(pixelCount)) {
             float* srcStage = stageSrcPtr();
@@ -2294,14 +2234,8 @@ void render(const OFX::RenderArguments& args) override {
               if (eSrc == cudaSuccess && eDst == cudaSuccess) {
                   const cudaError_t eSync = cudaStreamSynchronize(hostStream);
                 if (eSync == cudaSuccess) {
-                  try {
-                    (void)emitCubeViewerInputCloud(
-                        srcStage, cloudRowBytes, dstStage, cloudRowBytes, width, height);
-                  } catch (const std::exception& e) {
-                    cubeViewerDebugLog(std::string("CUDA input cloud emit threw: ") + e.what());
-                  } catch (...) {
-                    cubeViewerDebugLog("CUDA input cloud emit threw unknown exception.");
-                  }
+                  (void)emitCubeViewerInputCloud(
+                      srcStage, cloudRowBytes, dstStage, cloudRowBytes, width, height);
                 } else if (debugLogEnabled()) {
                   std::fprintf(stderr, "[ME_OpenDRT] Cube input cloud CUDA sync failed: %s\n", cudaGetErrorString(eSync));
                 }
@@ -2333,10 +2267,7 @@ void render(const OFX::RenderArguments& args) override {
     // - Uses host-provided command queue + MTLBuffer image handles.
     // - Avoids plugin-owned CPU staging copies.
     const bool preferHostMetal = (selectedMetalRenderMode() == MetalRenderMode::HostPreferred);
-    // Host-Metal returns before the generic host-readable cloud publish step below.
-    // When the viewer is in input-cloud mode, fall through to the existing staged/direct paths instead.
-    const bool tryHostMetal =
-        preferHostMetal && args.isEnabledMetalRender && (args.pMetalCmdQ != nullptr) && !allowInputCloudThisRender;
+    const bool tryHostMetal = preferHostMetal && args.isEnabledMetalRender && (args.pMetalCmdQ != nullptr);
     if (tryHostMetal) {
       const auto tHostMetal = std::chrono::steady_clock::now();
       const void* srcMetalBuffer = src->getPixelData();
@@ -2444,15 +2375,9 @@ void render(const OFX::RenderArguments& args) override {
       renderedDstPitch = rowBytes;
     }
 
-    if (rendered && allowInputCloudThisRender) {
-      try {
-        (void)pushCubeViewerInputCloud(
-            args.time, renderedSrcBase, renderedSrcPitch, renderedDstBase, renderedDstPitch, width, height);
-      } catch (const std::exception& e) {
-        cubeViewerDebugLog(std::string("Host input cloud push threw: ") + e.what());
-      } catch (...) {
-        cubeViewerDebugLog("Host input cloud push threw unknown exception.");
-      }
+    if (rendered && isFullFrameRenderWindow(bounds, args.renderWindow) && isHighQualityRenderForCloud(args)) {
+      (void)pushCubeViewerInputCloud(
+          args.time, renderedSrcBase, renderedSrcPitch, renderedDstBase, renderedDstPitch, width, height);
     }
 
     perfLog("Render total", tRenderStart);
@@ -2526,22 +2451,14 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         return;
       }
       if (paramName == "cubeViewerIdentity") {
-        const int desiredSource = getBool("cubeViewerIdentity", args.time, 1) ? 0 : 1;
-        if (getChoice("cubeViewerSource", args.time, 0) != desiredSource) {
-          FlagScope scope(suppressParamChanged_);
-          setChoice("cubeViewerSource", desiredSource);
-        }
+        setChoice("cubeViewerSource", getBool("cubeViewerIdentity", args.time, 1) ? 0 : 1);
         if (cubeViewerRequested_ && cubeViewerLive_) {
           pushCubeViewerUpdate(args.time, paramName, true);
         }
         return;
       }
       if (paramName == "cubeViewerSource") {
-        const bool desiredIdentity = (getChoice("cubeViewerSource", args.time, 0) == 0);
-        if (getBool("cubeViewerIdentity", args.time, 1) != (desiredIdentity ? 1 : 0)) {
-          FlagScope scope(suppressParamChanged_);
-          setBool("cubeViewerIdentity", desiredIdentity);
-        }
+        setBool("cubeViewerIdentity", getChoice("cubeViewerSource", args.time, 0) == 0 ? 1 : 0);
         if (cubeViewerRequested_ && cubeViewerLive_) {
           pushCubeViewerUpdate(args.time, paramName, true);
         }
@@ -4253,31 +4170,15 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
   }
 
   // Input-cloud gate: only emit when viewer is live/visible and source mode is input-image.
-  bool shouldEmitCubeViewerInputCloud(double time) {
-    if (!cubeViewerRequested_ || !cubeViewerLive_) {
-      if (debugLogEnabled()) cubeViewerDebugLogGate("Input cloud blocked: viewer not requested/live.");
-      return false;
-    }
-    // Allow emit path to self-heal stale connection state by attempting reconnect.
-    if (!cubeViewerRuntimeActiveForStreaming()) {
-      if (debugLogEnabled()) cubeViewerDebugLogGate("Input cloud blocked: runtime not active for streaming.");
-      return false;
-    }
-    if (getBool("cubeViewerIdentity", time, 1) != 0) {
-      if (debugLogEnabled()) cubeViewerDebugLogGate("Input cloud blocked: identity mode is enabled.");
-      return false;
-    }
+bool shouldEmitCubeViewerInputCloud(double time) {
+    if (!cubeViewerRequested_ || !cubeViewerLive_) return false;
+    if (!cubeViewerConnected_) return false;
+    if (!cubeViewerWindowUsable_) return false;
+    if (getBool("cubeViewerIdentity", time, 1) != 0) return false;
     const auto now = std::chrono::steady_clock::now();
     if (cubeViewerLastCloudSendAt_ != std::chrono::steady_clock::time_point::min()) {
       const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - cubeViewerLastCloudSendAt_).count();
-      if (ms < 8) {
-        if (debugLogEnabled()) {
-          std::ostringstream os;
-          os << "Input cloud throttled: sinceLastMs=" << ms;
-          cubeViewerDebugLogGate(os.str());
-        }
-        return false;
-      }
+      if (ms < 8) return false;
     }
     cubeViewerLastCloudSendAt_ = now;
     return true;
@@ -4378,7 +4279,6 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
       pts << clamp01(sr) << ' ' << clamp01(sg) << ' ' << clamp01(sb) << ' '
           << clamp01(dr) << ' ' << clamp01(dg) << ' ' << clamp01(db);
     }
-    if (first) return false;
 
     std::ostringstream os;
     os << "{";
@@ -4393,28 +4293,12 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
     os << "\"points\":\"" << jsonEscape(pts.str()) << "\"";
     os << "}";
 
-    if (debugLogEnabled()) {
-      std::ostringstream diag;
-      diag << "Emitting input cloud payload bytes=" << os.str().size()
-           << " points=" << targetPts
-           << " image=" << width << "x" << height
-           << " quality=" << cubeViewerQualityName(cubeViewerQuality_);
-      cubeViewerDebugLog(diag.str());
-    }
-
     if (sendCubeViewerMessage(os.str())) {
       cubeViewerConnected_ = true;
-      cubeViewerWindowUsable_ = true;
       setCubeViewerStatusLabel("Updating");
       return true;
     }
-    if (debugLogEnabled()) {
-      std::ostringstream diag;
-      diag << "Input cloud send failed, payload bytes=" << os.str().size();
-      cubeViewerDebugLog(diag.str());
-    }
     cubeViewerConnected_ = false;
-    cubeViewerWindowUsable_ = false;
     setCubeViewerStatusLabel("Disconnected");
     return false;
   }
@@ -4709,7 +4593,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   // ===== Plugin Descriptor =====
   // Host capability advertisement and static metadata.
   void describe(OFX::ImageEffectDescriptor& d) override {
-      static const std::string nameWithVersion = "ME_OpenDRT v1.2.8";
+    static const std::string nameWithVersion = "ME_OpenDRT v1.2.5b";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -5098,7 +4982,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
     supportOfxVersion->setLabel("OFX version");
-    supportOfxVersion->setDefault("v1.2.8");
+    supportOfxVersion->setDefault("v1.2.5b");
     supportOfxVersion->setEnabled(false);
     supportOfxVersion->setParent(*grpSupportRoot);
     pSupport->addChild(*supportOfxVersion);

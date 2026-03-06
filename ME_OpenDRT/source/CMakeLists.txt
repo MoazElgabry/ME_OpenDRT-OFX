@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(ME_OpenDRT VERSION 1.2.8 LANGUAGES CXX)
+project(ME_OpenDRT VERSION 1.2.5 LANGUAGES CXX)
+set(OPENDRT_DISPLAY_VERSION "1.2.5b")
 
 set(PLUGIN_BASENAME "ME_OpenDRT")
 option(ME_OPENDRT_LINUX_CUDA "Enable CUDA backend on Linux builds" ON)
@@ -134,33 +135,23 @@ if(APPLE)
   set(METAL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/metal/OpenDRT.metal")
   set(METAL_AIR "${CMAKE_CURRENT_BINARY_DIR}/OpenDRT.air")
   set(METAL_LIB "${CMAKE_CURRENT_BINARY_DIR}/OpenDRT.metallib")
-  set(METAL_MATH_FLAGS "")
   if(CMAKE_OSX_DEPLOYMENT_TARGET)
     set(METAL_MIN_OS "${CMAKE_OSX_DEPLOYMENT_TARGET}")
   else()
     set(METAL_MIN_OS "13.0")
   endif()
 
-  set(METAL_FLAG_PROBE_SRC "${CMAKE_CURRENT_BINARY_DIR}/metal_flag_probe.metal")
-  set(METAL_FLAG_PROBE_AIR "${CMAKE_CURRENT_BINARY_DIR}/metal_flag_probe.air")
-  file(WRITE "${METAL_FLAG_PROBE_SRC}" "kernel void flag_probe(device float* dst [[buffer(0)]], uint tid [[thread_position_in_grid]]) { dst[tid] = 0.0; }\n")
-  execute_process(
-    COMMAND "${XCRUN_EXECUTABLE}" -sdk macosx metal -std=macos-metal2.4 -fmetal-math-mode=safe -fmetal-math-fp32-functions=precise -mmacosx-version-min=${METAL_MIN_OS} -c "${METAL_FLAG_PROBE_SRC}" -o "${METAL_FLAG_PROBE_AIR}"
-    RESULT_VARIABLE METAL_SAFE_MATH_RESULT
-    OUTPUT_QUIET
-    ERROR_QUIET
-  )
-  if(METAL_SAFE_MATH_RESULT EQUAL 0)
-    set(METAL_MATH_FLAGS -fmetal-math-mode=safe -fmetal-math-fp32-functions=precise)
-    message(STATUS "Metal compiler supports safe/precise math flags")
-  else()
-    message(WARNING "Metal compiler does not support safe/precise math flags; building without them on this machine")
-  endif()
-
   add_custom_command(
     OUTPUT "${METAL_AIR}"
     # Use a broadly compatible Metal language version for Intel + Apple Silicon hosts.
-    COMMAND "${XCRUN_EXECUTABLE}" -sdk macosx metal -std=macos-metal2.4 ${METAL_MATH_FLAGS} -mmacosx-version-min=${METAL_MIN_OS} -c "${METAL_SRC}" -o "${METAL_AIR}"
+    # If future math edits produce Apple Silicon-only artifacts, first compare
+    # the shader helper behavior against CPU/OpenCL/CUDA. Only after that
+    # should you test compiler-side safe math flags such as:
+    #   -fmetal-math-mode=safe
+    #   -fmetal-math-fp32-functions=precise
+    # Those flags are not universally supported across Xcode/runner versions,
+    # so correctness should live in OpenDRT.metal rather than depending on them.
+    COMMAND "${XCRUN_EXECUTABLE}" -sdk macosx metal -std=macos-metal2.4 -mmacosx-version-min=${METAL_MIN_OS} -c "${METAL_SRC}" -o "${METAL_AIR}"
     DEPENDS "${METAL_SRC}" "${CMAKE_CURRENT_SOURCE_DIR}/src/OpenDRTParams.h"
     VERBATIM
   )
