@@ -2339,10 +2339,45 @@ void render(const OFX::RenderArguments& args) override {
               srcRowBytes,
               dstRowBytes,
               bounds.x1,
-              bounds.y1,
-              args.pMetalCmdQ)) {
+               bounds.y1,
+               args.pMetalCmdQ)) {
         hostMetalRendered = true;
         OpenDRTMetal::resetHostMetalFailureState();
+        // Stability-first cloud handoff:
+        // Reuse the already-rendered host-Metal frame when the host also exposes
+        // readable row pointers. This avoids the earlier crashy rerender/fallback
+        // path while still allowing cache population and one-shot handoff.
+        const bool canCaptureFromHostMetal =
+            srcLayout.valid && dstLayout.valid &&
+            ((needFirstCloudHandoff && cubeViewerRequested_ && cubeViewerLive_) || canUpdateInputCloudCache);
+        if (canCaptureFromHostMetal) {
+          CachedCubeViewerInputCloud cloudPayload{};
+          if (buildCubeViewerInputCloudPayload(
+                  args.time,
+                  srcLayout.base,
+                  srcLayout.pitchBytes,
+                  dstLayout.base,
+                  dstLayout.pitchBytes,
+                  width,
+                  height,
+                  &cloudPayload)) {
+            if (needFirstCloudHandoff || canUpdateInputCloudCache) {
+              maybeCaptureCubeViewerInputCloudCache(cloudPayload);
+            }
+            if (needFirstCloudHandoff || needSteadyStateCloud) {
+              (void)sendCubeViewerInputCloudPayload(
+                  cloudPayload,
+                  false,
+                  needFirstCloudHandoff ? "first-handoff/host-metal" : "steady-state/host-metal");
+            }
+          } else if (debugLogEnabled()) {
+            std::fprintf(stderr, "[ME_OpenDRT] Cube input cloud build failed on host-Metal frame.\n");
+          }
+        } else if (needFirstCloudHandoff && debugLogEnabled()) {
+          std::fprintf(
+              stderr,
+              "[ME_OpenDRT] Host-Metal handoff pending but host-readable layout unavailable.\n");
+        }
         perfLog("Backend render host Metal", tHostMetal);
         perfLog("Render total", tRenderStart);
         return;
