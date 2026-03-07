@@ -2577,6 +2577,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
           setChoice("cubeViewerSource", desiredSource);
         }
         cubeViewerInputCloudRefreshPending_ = !identityMode;
+        cubeViewerInputCloudHandoffQueued_.store(false, std::memory_order_relaxed);
         if (!identityMode) {
           cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
           if (debugLogEnabled()) {
@@ -2599,6 +2600,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
           setBool("cubeViewerIdentity", desiredIdentity);
         }
         cubeViewerInputCloudRefreshPending_ = !identityMode;
+        cubeViewerInputCloudHandoffQueued_.store(false, std::memory_order_relaxed);
         if (!identityMode) {
           cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
           if (debugLogEnabled()) {
@@ -4168,6 +4170,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         std::string paramsStatus;
         CachedCubeViewerInputCloud cloudPayload{};
         std::string cloudReason;
+        bool cloudIsFirstHandoff = false;
         bool haveParams = false;
         bool haveCloud = false;
         {
@@ -4188,6 +4191,8 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
             cloudPayload = cubeViewerPendingCloudPayload_;
             cloudReason = std::move(cubeViewerPendingCloudReason_);
             cubeViewerPendingCloudReason_.clear();
+            cloudIsFirstHandoff = cubeViewerPendingCloudIsFirstHandoff_;
+            cubeViewerPendingCloudIsFirstHandoff_ = false;
             cubeViewerPendingCloud_ = false;
             haveCloud = cloudPayload.valid && !cloudPayload.points.empty();
           }
@@ -4210,17 +4215,21 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
           if (debugLogEnabled()) {
             std::fprintf(
                 stderr,
-                "[ME_OpenDRT] Cube input cloud send (%s): payload=%zu bytes quality=%s res=%d pending=%d\n",
+                "[ME_OpenDRT] Cube input cloud send (%s): payload=%zu bytes quality=%s res=%d pending=%d first=%d\n",
                 cloudReason.empty() ? "unspecified" : cloudReason.c_str(),
                 json.size(),
                 cloudPayload.quality.c_str(),
                 cloudPayload.resolution,
-                cubeViewerInputCloudRefreshPending_ ? 1 : 0);
+                cubeViewerInputCloudRefreshPending_ ? 1 : 0,
+                cloudIsFirstHandoff ? 1 : 0);
           }
           if (sendCubeViewerMessage(json)) {
             cubeViewerConnected_ = true;
             cubeViewerWindowUsable_ = true;
-            cubeViewerInputCloudRefreshPending_ = false;
+            if (cloudIsFirstHandoff) {
+              cubeViewerInputCloudRefreshPending_ = false;
+              cubeViewerInputCloudHandoffQueued_.store(false, std::memory_order_relaxed);
+            }
             setCubeViewerStatusLabel("Updating");
           } else {
             if (debugLogEnabled()) {
@@ -4228,6 +4237,10 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
                   stderr,
                   "[ME_OpenDRT] Cube input cloud send failed (%s).\n",
                   cloudReason.empty() ? "unspecified" : cloudReason.c_str());
+            }
+            if (cloudIsFirstHandoff) {
+              cubeViewerInputCloudHandoffQueued_.store(false, std::memory_order_relaxed);
+              cubeViewerInputCloudRefreshPending_ = true;
             }
             cubeViewerConnected_ = false;
             cubeViewerWindowUsable_ = false;
@@ -4258,15 +4271,32 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     cubeViewerIoCv_.notify_one();
   }
 
-  void queueCubeViewerInputCloudPayload(const CachedCubeViewerInputCloud& payload, const char* reason) {
-    if (!payload.valid || payload.points.empty()) return;
+  bool queueCubeViewerInputCloudPayload(
+      const CachedCubeViewerInputCloud& payload,
+      const char* reason,
+      bool isFirstHandoff) {
+    if (!payload.valid || payload.points.empty()) return false;
+    if (isFirstHandoff) {
+      bool expected = false;
+      if (!cubeViewerInputCloudHandoffQueued_.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+        if (debugLogEnabled()) {
+          std::fprintf(
+              stderr,
+              "[ME_OpenDRT] Cube input cloud handoff already queued; skipping duplicate (%s).\n",
+              reason ? reason : "unspecified");
+        }
+        return false;
+      }
+    }
     {
       std::lock_guard<std::mutex> lock(cubeViewerIoMutex_);
       cubeViewerPendingCloudPayload_ = payload;
       cubeViewerPendingCloudReason_ = reason ? reason : "";
+      cubeViewerPendingCloudIsFirstHandoff_ = isFirstHandoff;
       cubeViewerPendingCloud_ = true;
     }
     cubeViewerIoCv_.notify_one();
+    return true;
   }
 
   bool cubeViewerRuntimeActiveForStreaming() const {
@@ -4431,6 +4461,7 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
     if (!cubeViewerRequested_ || !cubeViewerLive_) return false;
     if (getBool("cubeViewerIdentity", time, 1) != 0) return false;
     if (!cubeViewerInputCloudRefreshPending_) return false;
+    if (cubeViewerInputCloudHandoffQueued_.load(std::memory_order_relaxed)) return false;
     return cubeViewerInputCloudThrottleOpen();
   }
 
@@ -4579,13 +4610,11 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
 
   bool sendCubeViewerInputCloudPayload(
       const CachedCubeViewerInputCloud& payload,
-      bool /*allowReconnect*/,
+      bool isFirstHandoff,
       const char* reason) {
     if (!payload.valid || payload.points.empty()) return false;
     noteCubeViewerInputCloudAttempt();
-    const std::string json = buildCubeViewerInputCloudJson(payload);
-    queueCubeViewerInputCloudPayload(payload, reason);
-    return true;
+    return queueCubeViewerInputCloudPayload(payload, reason, isFirstHandoff);
   }
 
   bool trySendCachedCubeViewerInputCloud(double time, const char* reason) {
@@ -4878,6 +4907,8 @@ void closeCubeViewerSession() {
   bool cubeViewerPendingCloud_ = false;
   CachedCubeViewerInputCloud cubeViewerPendingCloudPayload_{};
   std::string cubeViewerPendingCloudReason_;
+  bool cubeViewerPendingCloudIsFirstHandoff_ = false;
+  std::atomic<bool> cubeViewerInputCloudHandoffQueued_{false};
   bool allowUiParamWrites_ = true;
   std::string cubeViewerLastParam_;
   std::chrono::steady_clock::time_point cubeViewerLastSendAt_ = std::chrono::steady_clock::time_point::min();
