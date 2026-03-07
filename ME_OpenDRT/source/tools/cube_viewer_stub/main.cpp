@@ -82,7 +82,7 @@ void logViewerEvent(const std::string& msg) {
 #endif
 }
 
-const char* kViewerVersionString = "v1.2.9b";
+const char* kViewerVersionString = "v1.2.9c";
 
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {
@@ -956,7 +956,7 @@ void processMouseAndKeys(GLFWwindow* window, AppState* app) {
     if (app->zoomMode) {
       const float zoomFactor = std::exp(dy * 0.0105f);
       app->cam.distance *= zoomFactor;
-      if (app->cam.distance < 0.6f) app->cam.distance = 0.6f;
+      if (app->cam.distance < 0.45f) app->cam.distance = 0.45f;
       if (app->cam.distance > 30.0f) app->cam.distance = 30.0f;
     } else if (app->panMode) {
       const float panScale = 0.0022f * app->cam.distance;
@@ -990,7 +990,7 @@ void processMouseAndKeys(GLFWwindow* window, AppState* app) {
     app->scrollAccum = 0.0f;
     const float factor = std::exp(-delta / 10.0f);
     app->cam.distance *= factor;
-    if (app->cam.distance < 0.6f) app->cam.distance = 0.6f;
+    if (app->cam.distance < 0.45f) app->cam.distance = 0.45f;
     if (app->cam.distance > 30.0f) app->cam.distance = 30.0f;
   }
 
@@ -1247,10 +1247,10 @@ int runApp() {
     float clampedDist = app.cam.distance;
     if (clampedDist < 0.6f) clampedDist = 0.6f;
     if (clampedDist > 30.0f) clampedDist = 30.0f;
-    float basePointSize = 2.5f;
-    if (mesh.resolution <= 25) basePointSize = 3.1f;
-    else if (mesh.resolution <= 41) basePointSize = 2.7f;
-    else basePointSize = 2.3f;
+  float basePointSize = 2.7f;
+  if (mesh.resolution <= 25) basePointSize = 3.3f;
+  else if (mesh.resolution <= 41) basePointSize = 2.9f;
+  else basePointSize = 2.5f;
     const float distanceFactor = std::pow(clampedDist / 4.2f, -0.68f);
     const size_t pointCount = mesh.pointVerts.size() / 3u;
     float densityFactor = 1.0f;
