@@ -82,6 +82,25 @@ void logViewerEvent(const std::string& msg) {
 #endif
 }
 
+const char* kViewerVersionString = "v1.2.8b";
+
+#if !defined(_WIN32)
+bool sendAllSocket(int fd, const char* data, size_t size) {
+  if (fd < 0 || data == nullptr) return false;
+  size_t totalSent = 0;
+  while (totalSent < size) {
+    const ssize_t sent = ::send(fd, data + totalSent, size - totalSent, 0);
+    if (sent <= 0) {
+      logViewerEvent(std::string("socket send failed after ") + std::to_string(totalSent) + "/" +
+                     std::to_string(size) + " bytes: errno=" + std::to_string(errno) + " (" + std::strerror(errno) + ")");
+      return false;
+    }
+    totalSent += static_cast<size_t>(sent);
+  }
+  return true;
+}
+#endif
+
 struct CameraState {
   float qx = 0.0f;
   float qy = 0.0f;
@@ -224,6 +243,10 @@ struct PendingMessage {
   uint64_t seq = 0;
   std::string line;
 };
+
+bool senderMatchesCurrent(const std::string& currentSenderId, const std::string& senderId) {
+  return currentSenderId.empty() || senderId.empty() || senderId == currentSenderId;
+}
 
 std::mutex gMsgMutex;
 PendingMessage gPendingParamsMsg;
@@ -815,10 +838,13 @@ void ipcServerLoop() {
         if (!response.empty()) {
           std::string payload = response;
           payload.push_back('\n');
-          (void)::send(client, payload.data(), payload.size(), 0);
+          (void)sendAllSocket(client, payload.data(), payload.size());
         }
         pending.erase(0, nl + 1);
       }
+    }
+    if (!pending.empty()) {
+      logViewerEvent(std::string("Connection closed with unterminated payload bytes=") + std::to_string(pending.size()));
     }
     ::close(client);
   }
@@ -836,7 +862,7 @@ void wakeIpcServer() {
   std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
   if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
     const char nl = '\n';
-    (void)::send(fd, &nl, 1, 0);
+    (void)sendAllSocket(fd, &nl, 1);
   }
   ::close(fd);
 }
@@ -978,7 +1004,7 @@ int runApp() {
 #endif
     return 1;
   }
-  logViewerEvent("Viewer startup ok");
+  logViewerEvent(std::string("Viewer startup ok ") + kViewerVersionString);
 
   glfwMakeContextCurrent(window);
   glfwSwapInterval(1);
@@ -1020,6 +1046,8 @@ int runApp() {
   mesh.maxDelta = 0.0f;
   uint64_t lastParamsSeq = 0;
   uint64_t lastCloudSeq = 0;
+  InputCloudPayload deferredCloud{};
+  bool hasDeferredCloud = false;
 
   while (gRun.load() && !glfwWindowShouldClose(window)) {
     glfwPollEvents();
@@ -1047,52 +1075,83 @@ int runApp() {
     }
     if (haveParams) {
       ResolvedPayload rp{};
-      if (parseParamsMessage(pendingParams.line, &rp)) {
-        if (!rp.senderId.empty() && rp.senderId != app.currentSenderId) {
-          app.currentSenderId = rp.senderId;
-          lastParamsSeq = 0;
-          lastCloudSeq = 0;
-        }
-        if (rp.seq < lastParamsSeq) {
-          // Ignore stale param snapshots/deltas within the params stream.
-        } else {
-          lastParamsSeq = rp.seq;
-          const std::string prevSourceMode = app.currentSourceMode;
-          app.keepOnTop = (rp.alwaysOnTop != 0);
-          app.currentSourceMode = rp.sourceMode;
-          if (app.currentSourceMode != "input") {
-            MeshData nextMesh{};
-            buildCubeData(rp, &nextMesh);
-            mesh = std::move(nextMesh);
+      try {
+        if (parseParamsMessage(pendingParams.line, &rp)) {
+          if (!rp.senderId.empty() && rp.senderId != app.currentSenderId) {
+            app.currentSenderId = rp.senderId;
+            lastParamsSeq = 0;
+            lastCloudSeq = 0;
+            hasDeferredCloud = false;
+          }
+          if (rp.seq < lastParamsSeq) {
+            // Ignore stale param snapshots/deltas within the params stream.
           } else {
-            // Keep last displayed mesh until an input_cloud payload arrives.
-            // This avoids flicker/blank frames on mode switch and live param deltas.
-            mesh.quality = rp.quality;
-            mesh.resolution = rp.resolution;
-            mesh.paramHash = rp.paramHash;
-            mesh.renderOk = true;
-            mesh.maxDelta = 0.0f;
-            if (prevSourceMode != "input") {
-              // Reset pan only when switching modes so stale framing does not hide the cloud.
-              app.cam.panX = 0.0f;
-              app.cam.panY = 0.0f;
+            lastParamsSeq = rp.seq;
+            const std::string prevSourceMode = app.currentSourceMode;
+            app.keepOnTop = (rp.alwaysOnTop != 0);
+            app.currentSourceMode = rp.sourceMode;
+            if (app.currentSourceMode != "input") {
+              MeshData nextMesh{};
+              buildCubeData(rp, &nextMesh);
+              mesh = std::move(nextMesh);
+            } else {
+              // Keep last displayed mesh until an input_cloud payload arrives.
+              // This avoids flicker/blank frames on mode switch and live param deltas.
+              mesh.quality = rp.quality;
+              mesh.resolution = rp.resolution;
+              mesh.paramHash = rp.paramHash;
+              mesh.renderOk = true;
+              mesh.maxDelta = 0.0f;
+              if (prevSourceMode != "input") {
+                // Reset pan only when switching modes so stale framing does not hide the cloud.
+                app.cam.panX = 0.0f;
+                app.cam.panY = 0.0f;
+              }
+              if (hasDeferredCloud && deferredCloud.seq >= lastCloudSeq &&
+                  senderMatchesCurrent(app.currentSenderId, deferredCloud.senderId)) {
+                MeshData nextMesh{};
+                if (buildInputCloudMesh(deferredCloud, &nextMesh)) {
+                  mesh = std::move(nextMesh);
+                  lastCloudSeq = deferredCloud.seq;
+                  hasDeferredCloud = false;
+                  logViewerEvent("Applied deferred input cloud after params switched to input mode.");
+                }
+              }
             }
           }
         }
+      } catch (const std::exception& e) {
+        logViewerEvent(std::string("Exception while processing params message: ") + e.what());
+      } catch (...) {
+        logViewerEvent("Unknown exception while processing params message.");
       }
     }
     if (haveCloud) {
       InputCloudPayload cp{};
-      if (parseInputCloudMessage(pendingCloud.line, &cp)) {
-        if (!app.currentSenderId.empty() && !cp.senderId.empty() && cp.senderId != app.currentSenderId) {
-          // Ignore clouds from a different OFX instance than the active sender.
-        } else if (cp.seq >= lastCloudSeq && app.currentSourceMode == "input") {
-          MeshData nextMesh{};
-          if (buildInputCloudMesh(cp, &nextMesh)) {
-            mesh = std::move(nextMesh);
-            lastCloudSeq = cp.seq;
+      try {
+        if (parseInputCloudMessage(pendingCloud.line, &cp)) {
+          if (!senderMatchesCurrent(app.currentSenderId, cp.senderId)) {
+            // Ignore clouds from a different OFX instance than the active sender.
+            logViewerEvent("Ignored input cloud from non-active sender.");
+          } else if (cp.seq < lastCloudSeq) {
+            logViewerEvent("Ignored stale input cloud sequence.");
+          } else if (app.currentSourceMode != "input") {
+            deferredCloud = cp;
+            hasDeferredCloud = true;
+            logViewerEvent("Deferred input cloud until params confirm input mode.");
+          } else {
+            MeshData nextMesh{};
+            if (buildInputCloudMesh(cp, &nextMesh)) {
+              mesh = std::move(nextMesh);
+              lastCloudSeq = cp.seq;
+              hasDeferredCloud = false;
+            }
           }
         }
+      } catch (const std::exception& e) {
+        logViewerEvent(std::string("Exception while processing input cloud message: ") + e.what());
+      } catch (...) {
+        logViewerEvent("Unknown exception while processing input cloud message.");
       }
     }
 
@@ -1143,8 +1202,8 @@ int runApp() {
     glVertexPointer(3, GL_FLOAT, 0, mesh.pointVerts.empty() ? nullptr : mesh.pointVerts.data());
     glColorPointer(3, GL_FLOAT, 0, mesh.pointColors.empty() ? nullptr : mesh.pointColors.data());
     glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(mesh.pointVerts.size() / 3u));
-    if (!mesh.pointVerts.empty() && app.currentSourceMode != "input") {
-      // Subtle interior fill pass to improve visibility around the cube core/achromatic axis.
+    if (!mesh.pointVerts.empty()) {
+      // Subtle interior fill pass to improve interior visibility for both identity and input cloud modes.
       glDisable(GL_DEPTH_TEST);
       glDisableClientState(GL_COLOR_ARRAY);
       glColor4f(0.95f, 0.96f, 1.0f, 0.05f);
