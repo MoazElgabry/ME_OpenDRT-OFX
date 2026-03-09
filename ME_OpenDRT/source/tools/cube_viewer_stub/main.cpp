@@ -82,7 +82,7 @@ void logViewerEvent(const std::string& msg) {
 #endif
 }
 
-const char* kViewerVersionString = "v1.2.9c";
+const char* kViewerVersionString = "v1.2.10";
 
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {
@@ -223,6 +223,25 @@ void resetCamera(CameraState* cam) {
   const Quat qPitch = axisAngleQ(Vec3{1.0f, 0.0f, 0.0f}, 20.0f * deg2rad);
   const Quat qYaw = axisAngleQ(Vec3{0.0f, 1.0f, 0.0f}, -45.0f * deg2rad);
   const Quat q = normalizeQ(mulQ(qPitch, qYaw));
+  cam->qx = q.x;
+  cam->qy = q.y;
+  cam->qz = q.z;
+  cam->qw = q.w;
+}
+
+void resetVectorscopeCamera(CameraState* cam) {
+  if (!cam) return;
+  cam->distance = 4.35f;
+  cam->panX = 0.0f;
+  cam->panY = 0.0f;
+  const float deg2rad = 3.14159265358979323846f / 180.0f;
+  // Look roughly down the neutral axis so RGB corners read like a vectorscope.
+  const Quat qPitch = axisAngleQ(Vec3{1.0f, 0.0f, 0.0f}, 35.2643897f * deg2rad);
+  const Quat qYaw = axisAngleQ(Vec3{0.0f, 1.0f, 0.0f}, -45.0f * deg2rad);
+  const Quat qView = normalizeQ(mulQ(qPitch, qYaw));
+  // Rotate within the view plane to match the familiar vectorscope orientation.
+  const Quat qRoll = axisAngleQ(Vec3{0.0f, 0.0f, 1.0f}, 135.0f * deg2rad);
+  const Quat q = normalizeQ(mulQ(qRoll, qView));
   cam->qx = q.x;
   cam->qy = q.y;
   cam->qz = q.z;
@@ -404,6 +423,7 @@ struct ResolvedPayload {
   int display_gamut = 0;
   int eotf = 2;
   std::string sourceMode = "identity";
+  int plotInLinear = 0;
   int alwaysOnTop = 0;
   std::string quality = "Medium";
   std::string paramHash;
@@ -435,6 +455,7 @@ bool parseParamsMessage(const std::string& msg, ResolvedPayload* out) {
   if (extractJsonInt(msg, "resolution", &resolution)) out->resolution = resolution;
   extractJsonString(msg, "quality", &out->quality);
   extractJsonString(msg, "sourceMode", &out->sourceMode);
+  extractJsonInt(msg, "plotInLinear", &out->plotInLinear);
   extractJsonInt(msg, "alwaysOnTop", &out->alwaysOnTop);
   extractJsonString(msg, "paramHash", &out->paramHash);
   extractJsonInt(msg, "in_gamut", &out->in_gamut);
@@ -570,6 +591,9 @@ OpenDRTParams buildResolvedParams(const ResolvedPayload& rp) {
   TonescalePresetValues toneVals{};
   if (!rp.tonescalePayload.empty() && parseTonescaleValues(rp.tonescalePayload, &toneVals)) {
     applyTonescaleValuesToResolved(p, toneVals);
+  }
+  if (rp.plotInLinear != 0) {
+    p.eotf = 0;
   }
   return p;
 }
@@ -897,7 +921,7 @@ struct AppState {
   std::string currentSenderId;
   double lastX = 0.0;
   double lastY = 0.0;
-  double lastClick = 0.0;
+  double lastClick = -10.0;
   float scrollAccum = 0.0f;
 };
 
@@ -920,6 +944,26 @@ void onScroll(GLFWwindow* window, double, double yoff) {
   app->scrollAccum += static_cast<float>(yoff) * scale;
 }
 
+void onMouseButton(GLFWwindow* window, int button, int action, int) {
+  auto* app = reinterpret_cast<AppState*>(glfwGetWindowUserPointer(window));
+  if (!app) return;
+  if (button != GLFW_MOUSE_BUTTON_LEFT || action != GLFW_PRESS) return;
+  const double now = glfwGetTime();
+  if ((now - app->lastClick) < 0.3) {
+    const bool ctrl = (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+                       glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
+    if (ctrl) {
+      resetVectorscopeCamera(&app->cam);
+    } else {
+      resetCamera(&app->cam);
+    }
+    app->leftDown = false;
+    app->panMode = false;
+    app->zoomMode = false;
+  }
+  app->lastClick = now;
+}
+
 void processMouseAndKeys(GLFWwindow* window, AppState* app) {
   if (!app) return;
   const int l = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT);
@@ -937,11 +981,6 @@ void processMouseAndKeys(GLFWwindow* window, AppState* app) {
     app->panMode = !app->zoomMode && ((m == GLFW_PRESS) || shift);
     app->lastX = cx;
     app->lastY = cy;
-    const double now = glfwGetTime();
-    if (l == GLFW_PRESS && (now - app->lastClick) < 0.3) {
-      resetCamera(&app->cam);
-    }
-    app->lastClick = now;
   } else if (!anyDown && app->leftDown) {
     app->leftDown = false;
     app->panMode = false;
@@ -1057,6 +1096,7 @@ int runApp() {
   glfwSetFramebufferSizeCallback(window, onFramebufferSize);
   glfwSetWindowCloseCallback(window, onWindowClose);
   glfwSetScrollCallback(window, onScroll);
+  glfwSetMouseButtonCallback(window, onMouseButton);
 
   glEnable(GL_DEPTH_TEST);
   glEnable(GL_BLEND);

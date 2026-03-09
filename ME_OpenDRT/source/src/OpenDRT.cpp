@@ -2091,6 +2091,7 @@ const char* tooltipForParam(const std::string& name) {
     {"closeCubeViewer", "Disconnect this OFX instance from the viewer. The viewer window stays open and can be re-attached via Open."},
     {"cubeViewerLive", "When enabled, parameter edits stream to the external viewer. Disabled means on-demand/manual updates only."},
     {"cubeViewerIdentity", "Toggle visualization source: ON uses transformed identity cube, OFF uses transformed input-image point cloud."},
+    {"cubeViewerPlotInLinear", "Plot the cube and image cloud in display-linear space by stopping before the final display encoding step."},
     {"cubeViewerOnTop", "Keep the external viewer window above the host while tweaking controls."},
     {"cubeViewerQuality", "Viewer sampling density for the 3D cube (Low=25^3, about 45k points; Medium=41^3, about 90k points; High=57^3, about 180k points)."},
     {"cubeViewerStatus", "Connection state for external 3D identity-cube viewer."}
@@ -2564,6 +2565,12 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
       }
       if (paramName == "cubeViewerQuality") {
         cubeViewerQuality_ = getChoice("cubeViewerQuality", args.time, 1);
+        if (cubeViewerRequested_ && cubeViewerLive_) {
+          pushCubeViewerUpdate(args.time, paramName, true);
+        }
+        return;
+      }
+      if (paramName == "cubeViewerPlotInLinear") {
         if (cubeViewerRequested_ && cubeViewerLive_) {
           pushCubeViewerUpdate(args.time, paramName, true);
         }
@@ -4511,10 +4518,22 @@ void refreshCubeViewerConnectionHealth() {
     std::string tonePayload;
     serializeLookValues(captureCurrentLookValues(time), lookPayload);
     serializeTonescaleValues(captureCurrentTonescaleValues(time), tonePayload);
-    const std::string hashInput = lookPayload + "|" + tonePayload + "|" + std::to_string(raw.lookPreset) + "|" +
-                                  std::to_string(raw.tonescalePreset) + "|" + std::to_string(raw.creativeWhitePreset) +
-                                  "|" + std::to_string(raw.displayEncodingPreset);
-    return std::to_string(std::hash<std::string>{}(hashInput));
+    std::ostringstream hashInput;
+    hashInput << lookPayload << "|" << tonePayload
+              << "|" << raw.lookPreset
+              << "|" << raw.tonescalePreset
+              << "|" << raw.creativeWhitePreset
+              << "|" << raw.displayEncodingPreset
+              << "|" << raw.display_gamut
+              << "|" << raw.eotf
+              << "|" << raw.tn_su
+              << "|" << raw.tn_Lp
+              << "|" << raw.tn_Lg
+              << "|" << raw.tn_gb
+              << "|" << raw.pt_hdr
+              << "|" << raw.clamp
+              << "|" << raw.cubeViewerPlotInLinear;
+    return std::to_string(std::hash<std::string>{}(hashInput.str()));
   }
 
   // Snapshot/delta payload builder: canonical params + compact payloads for external cube visualization.
@@ -4534,6 +4553,7 @@ std::string buildCubeViewerParamsJson(double time, bool deltaOnly, const std::st
     os << "\"quality\":\"" << cubeViewerQualityName(cubeViewerQuality_) << "\",";
     os << "\"resolution\":" << cubeViewerQualityToResolution(cubeViewerQuality_) << ",";
     os << "\"sourceMode\":\"" << cubeViewerSourceModeName(getBool("cubeViewerIdentity", time, 1) ? 0 : 1) << "\",";
+    os << "\"plotInLinear\":" << (getBool("cubeViewerPlotInLinear", time, 0) ? 1 : 0) << ",";
     os << "\"alwaysOnTop\":" << (getBool("cubeViewerOnTop", time, 0) ? 1 : 0) << ",";
     os << "\"paramHash\":\"" << currentCubeViewerParamsHash(time) << "\",";
     if (deltaOnly) {
@@ -4644,6 +4664,7 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
     const size_t dstStrideFloats = dstRowBytes / sizeof(float);
     const size_t minStrideFloats = static_cast<size_t>(width) * 4u;
     if (srcStrideFloats < minStrideFloats || dstStrideFloats < minStrideFloats) return false;
+    const bool plotInLinear = getBool("cubeViewerPlotInLinear", time, 0) != 0;
 
     std::ostringstream pts;
     pts.setf(std::ios::fixed);
@@ -4695,6 +4716,12 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
       return true;
     };
 
+    std::vector<float> sampledSrc;
+    std::vector<float> sampledDst;
+    if (plotInLinear) {
+      sampledSrc.reserve(targetPts * 4u);
+    }
+
     for (size_t n = 0; n < targetPts; ++n) {
       // Sample fixed normalized locations so drag/release host render-scale changes
       // do not produce visibly different cloud geometry.
@@ -4710,11 +4737,41 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
           !std::isfinite(dr) || !std::isfinite(dg) || !std::isfinite(db)) {
         continue;
       }
+      if (plotInLinear) {
+        sampledSrc.push_back(sr);
+        sampledSrc.push_back(sg);
+        sampledSrc.push_back(sb);
+        sampledSrc.push_back(1.0f);
+        continue;
+      }
       if (!first) pts << ' ';
       first = false;
       // Plot coordinates are clamped to cube bounds to avoid out-of-range spikes.
       pts << clamp01(sr) << ' ' << clamp01(sg) << ' ' << clamp01(sb) << ' '
           << clamp01(dr) << ' ' << clamp01(dg) << ' ' << clamp01(db);
+    }
+
+    if (plotInLinear) {
+      if (sampledSrc.empty()) return false;
+      sampledDst.assign(sampledSrc.size(), 1.0f);
+      OpenDRTParams viewerParams = resolveParams(readRawValues(time));
+      viewerParams.eotf = 0;
+      OpenDRTProcessor viewerProcessor(viewerParams);
+      if (!viewerProcessor.render(sampledSrc.data(), sampledDst.data(), static_cast<int>(sampledSrc.size() / 4u), 1, true, false)) {
+        return false;
+      }
+      for (size_t i = 0; i + 3u < sampledSrc.size(); i += 4u) {
+        const float sr = sampledSrc[i + 0];
+        const float sg = sampledSrc[i + 1];
+        const float sb = sampledSrc[i + 2];
+        const float dr = sampledDst[i + 0];
+        const float dg = sampledDst[i + 1];
+        const float db = sampledDst[i + 2];
+        if (!first) pts << ' ';
+        first = false;
+        pts << clamp01(sr) << ' ' << clamp01(sg) << ' ' << clamp01(sb) << ' '
+            << clamp01(dr) << ' ' << clamp01(dg) << ' ' << clamp01(db);
+      }
     }
 
     if (first) return false;
@@ -4984,6 +5041,7 @@ void closeCubeViewerSession() {
     r.tn_su = getChoice("tn_su", time, 1);
     r.display_gamut = getChoice("display_gamut", time, 0);
     r.eotf = getChoice("eotf", time, 2);
+    r.cubeViewerPlotInLinear = getBool("cubeViewerPlotInLinear", time, 0);
 
     return r;
   }
@@ -5073,7 +5131,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   // ===== Plugin Descriptor =====
   // Host capability advertisement and static metadata.
   void describe(OFX::ImageEffectDescriptor& d) override {
-static const std::string nameWithVersion = "ME_OpenDRT v1.2.9c";
+static const std::string nameWithVersion = "ME_OpenDRT v1.2.10";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -5113,7 +5171,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     dst->setSupportsTiles(false);
 
     auto* grpUserPresetsRoot = d.defineGroupParam("grp_user_presets_root");
-    grpUserPresetsRoot->setLabel("User Preset Manager");
+    grpUserPresetsRoot->setLabel("PRESET Manager");
     grpUserPresetsRoot->setOpen(false);
 
     auto addChoice = [&d](const char* name, const char* label, int def, const std::vector<const char*>& opts) {
@@ -5138,14 +5196,10 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     auto* inOetf = addChoice("in_oetf", "Input Transfer Function", 1, {"Linear","DaVinci Intermediate","Filmlight T-Log","ACEScct","Arri LogC3","Arri LogC4","RedLog3G10","Panasonic V-Log","Sony S-Log3","Fuji F-Log2"});
 
     auto* dep = addChoice("displayEncodingPreset", "Display Encoding Preset", 0, {"Rec.1886 - 2.4 Power / Rec.709","sRGB Display - 2.2 Power / Rec.709","Display P3 - 2.2 Power / P3-D65","DCI - 2.6 Power / P3-D60","DCI - 2.6 Power / P3-DCI","DCI - 2.6 Power / XYZ","Rec.2100 - PQ / Rec.2020","Rec.2100 - HLG / Rec.2020","Dolby - PQ / P3-D65"});
-    auto* lookPreset = addChoice("lookPreset", "Look Preset", 0, {"Standard","Arriba","Sylvan","Colorful","Aery","Dystopic","Umbra","Base"});
-    for (const auto& n : visibleUserLookNames()) lookPreset->appendOption(n);
     auto* presetState = d.defineIntParam("presetState"); presetState->setIsSecret(true); presetState->setDefault(0);
     auto* cwpHidden = d.defineIntParam("cwp"); cwpHidden->setIsSecret(true); cwpHidden->setDefault(2);
     auto* activeUserLookSlot = d.defineIntParam("activeUserLookSlot"); activeUserLookSlot->setIsSecret(true); activeUserLookSlot->setDefault(-1);
     auto* activeUserToneSlot = d.defineIntParam("activeUserToneSlot"); activeUserToneSlot->setIsSecret(true); activeUserToneSlot->setDefault(-1);
-    auto* tonescalePreset = addChoice("tonescalePreset", "Tonescale Preset", 0, {"USE LOOK PRESET","Low Contrast","Medium Contrast","High Contrast","Arriba Tonescale","Sylvan Tonescale","Colorful Tonescale","Aery Tonescale","Dystopic Tonescale","Umbra Tonescale","ACES-1.x","ACES-2.0","Marvelous Tonescape","DaGrinchi ToneGroan"});
-    for (const auto& n : visibleUserTonescaleNames()) tonescalePreset->appendOption(n);
     auto* cwpPreset = addChoice("creativeWhitePreset", "Creative White", 0, {"USE LOOK PRESET","D93","D75","D65","D60","D55","D50"});
     auto* cwpLm = addDouble("cwp_lm", "Creative White Limit", 0.25, 0.0, 1.0);
     auto* baseWpLabel = d.defineStringParam("baseWhitepointLabel");
@@ -5162,25 +5216,24 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     cwpHidden->setParent(*grpBasicRoot);
     activeUserLookSlot->setParent(*grpBasicRoot);
     activeUserToneSlot->setParent(*grpBasicRoot);
-    auto* grpDisplay = d.defineGroupParam("grp_display"); grpDisplay->setLabel("Display Encoding"); grpDisplay->setOpen(false);
-    auto* grpDrtLook = d.defineGroupParam("grp_drt_look");
-    grpDrtLook->setLabel("DRT Look");
-    grpDrtLook->setOpen(true);
-    lookPreset->setParent(*grpDrtLook);
-    tonescalePreset->setParent(*grpDrtLook);
-    cwpPreset->setParent(*grpDrtLook);
-    cwpLm->setParent(*grpDrtLook);
-    baseWpLabel->setParent(*grpDrtLook);
+    auto* grpDisplay = d.defineGroupParam("grp_display"); grpDisplay->setLabel("Display Encoding Settings"); grpDisplay->setOpen(false);
+    auto* lookPreset = addChoice("lookPreset", "DRT Look Preset", 0, {"Standard","Arriba","Sylvan","Colorful","Aery","Dystopic","Umbra","Base"});
+    for (const auto& n : visibleUserLookNames()) lookPreset->appendOption(n);
+    auto* tonescalePreset = addChoice("tonescalePreset", "Tonescale Preset", 0, {"USE LOOK PRESET","Low Contrast","Medium Contrast","High Contrast","Arriba Tonescale","Sylvan Tonescale","Colorful Tonescale","Aery Tonescale","Dystopic Tonescale","Umbra Tonescale","ACES-1.x","ACES-2.0","Marvelous Tonescape","DaGrinchi ToneGroan"});
+    for (const auto& n : visibleUserTonescaleNames()) tonescalePreset->appendOption(n);
+    auto* grpAdvancedRoot = d.defineGroupParam("grp_advanced_root"); grpAdvancedRoot->setLabel("Advanced Look Control"); grpAdvancedRoot->setOpen(false);
+    cwpPreset->setParent(*grpAdvancedRoot);
+    cwpLm->setParent(*grpAdvancedRoot);
+    baseWpLabel->setParent(*grpAdvancedRoot);
     auto* discardPresetChanges = d.definePushButtonParam("discardPresetChanges");
     discardPresetChanges->setLabel("Discard Changes");
     discardPresetChanges->setEnabled(false);
-    discardPresetChanges->setParent(*grpDrtLook);
+    discardPresetChanges->setParent(*grpAdvancedRoot);
     auto* overlay = d.defineBooleanParam("crv_enable");
     overlay->setLabel("Tonescale Overlay");
     overlay->setDefault(false);
     if (const char* hint = tooltipForParam("crv_enable")) overlay->setHint(hint);
-    overlay->setParent(*grpDrtLook);
-    auto* grpAdvancedRoot = d.defineGroupParam("grp_advanced_root"); grpAdvancedRoot->setLabel("Advanced Look Control"); grpAdvancedRoot->setOpen(false);
+    overlay->setParent(*grpAdvancedRoot);
     auto* grpTone = d.defineGroupParam("grp_tonescale"); grpTone->setLabel("Tonescale"); grpTone->setOpen(false); grpTone->setParent(*grpAdvancedRoot);
     auto* grpRender = d.defineGroupParam("grp_render"); grpRender->setLabel("Render Space"); grpRender->setOpen(false); grpRender->setParent(*grpAdvancedRoot);
     auto* grpMidPurity = d.defineGroupParam("grp_mid_purity"); grpMidPurity->setLabel("Mid Purity"); grpMidPurity->setOpen(false); grpMidPurity->setParent(*grpAdvancedRoot);
@@ -5384,6 +5437,11 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     cubeViewerIdentity->setDefault(true);
     if (const char* hint = tooltipForParam("cubeViewerIdentity")) cubeViewerIdentity->setHint(hint);
 
+    auto* cubeViewerPlotLinear = d.defineBooleanParam("cubeViewerPlotInLinear");
+    cubeViewerPlotLinear->setLabel("Plot in Linear");
+    cubeViewerPlotLinear->setDefault(false);
+    if (const char* hint = tooltipForParam("cubeViewerPlotInLinear")) cubeViewerPlotLinear->setHint(hint);
+
     auto* grpSupportRoot = d.defineGroupParam("grp_support_root");
     grpSupportRoot->setLabel("Support");
     grpSupportRoot->setOpen(false);
@@ -5409,7 +5467,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
     supportOfxVersion->setLabel("OFX version");
-    supportOfxVersion->setDefault("v1.2.9c");
+    supportOfxVersion->setDefault("v1.2.10");
     supportOfxVersion->setEnabled(false);
     supportOfxVersion->setParent(*grpSupportRoot);
   }
