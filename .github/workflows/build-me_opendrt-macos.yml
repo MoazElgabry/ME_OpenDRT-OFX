@@ -1,4 +1,4 @@
-name: Build ME_OpenDRT macOS (arm64 + x86_64)
+name: Build ME_OpenDRT macOS (universal)
 
 on:
   workflow_dispatch:
@@ -9,21 +9,11 @@ on:
 jobs:
   build-macos:
     env:
-      OPENDRT_VERSION: v1.2.10
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: macos-14
-            zip_name: ME_OpenDRT_v1.2.10_macOS_arm64_portable.zip
-            artifact_name: ME_OpenDRT-v1.2.10-macos-arm64
-          - arch: x86_64
-            runner: macos-15-intel
-            zip_name: ME_OpenDRT_v1.2.10_macOS_x86_64_portable.zip
-            artifact_name: ME_OpenDRT-v1.2.10-macos-x86_64
+      OPENDRT_VERSION: v1.2.11
+      ZIP_NAME: ME_OpenDRT_v1.2.11_macOS_universal_portable.zip
+      ARTIFACT_NAME: ME_OpenDRT-v1.2.11-macos-universal
 
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-14
 
     defaults:
       run:
@@ -44,7 +34,7 @@ jobs:
           fi
 
       - name: Configure
-        run: cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DME_OPENDRT_BUILD_CUBE_VIEWER_STUB=ON -DME_OPENDRT_VIEWER_FORCE_BUNDLED_GLFW=ON
+        run: cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DME_OPENDRT_BUILD_CUBE_VIEWER_STUB=ON -DME_OPENDRT_VIEWER_FORCE_BUNDLED_GLFW=ON
 
       - name: Build
         run: cmake --build build-mac --config Release
@@ -54,7 +44,10 @@ jobs:
           test -f bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx
           test -f bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT_CubeViewer
           test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib
+          lipo -archs bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx | grep -q "x86_64 arm64"
+          lipo -archs bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT_CubeViewer | grep -q "x86_64 arm64"
           otool -l bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
+          otool -l bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT_CubeViewer | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
           strings bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib | grep -E -q "air64-apple-macosx13(\\.|$)"
           xcrun metal-objdump -t bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib | grep -q "OpenDRTKernel"
 
@@ -62,10 +55,10 @@ jobs:
         run: |
           ditto -c -k --sequesterRsrc --keepParent \
             bundle/ME_OpenDRT.ofx.bundle \
-            ../../${{ matrix.zip_name }}
+            ../../${ZIP_NAME}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.zip_name }}
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ZIP_NAME }}
