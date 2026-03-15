@@ -1060,28 +1060,6 @@ bool renderScene(GLFWwindow* window,
                       vertexStart:0
                       vertexCount:4
                     instanceCount:source.pointCount];
-
-          SolidColorUniforms solid{};
-          solid.color[0] = 0.95f;
-          solid.color[1] = 0.96f;
-          solid.color[2] = 1.0f;
-          solid.color[3] = 0.05f;
-          copySceneUniforms(mvp,
-                            &scene,
-                            fillPointSize,
-                            1.0f,
-                            static_cast<float>(ctx.layer.drawableSize.width),
-                            static_cast<float>(ctx.layer.drawableSize.height));
-          [encoder setDepthStencilState:nil];
-          [encoder setRenderPipelineState:ctx.pointSolidPipeline];
-          [encoder setVertexBuffer:vertsBuffer offset:0 atIndex:0];
-          [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:2];
-          [encoder setFragmentBytes:&solid length:sizeof(solid) atIndex:0];
-          [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
-                      vertexStart:0
-                      vertexCount:4
-                    instanceCount:source.pointCount];
-          [encoder setDepthStencilState:ctx.depthState];
         }
       }
 

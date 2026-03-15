@@ -2873,6 +2873,7 @@ int runApp() {
               logViewerDiagnostic(true, os.str());
             }
             if (app.currentSourceMode != "input") {
+              logViewerEvent("Building identity mesh from params.");
               MeshData nextMesh{};
               buildCubeData(rp, app.gpuCaps, &app.runtime, &identityComputeCache,
 #if defined(__APPLE__)
@@ -2882,6 +2883,15 @@ int runApp() {
                             &identityCudaCache,
 #endif
                             &nextMesh);
+              {
+                std::ostringstream os;
+                os << "Identity mesh build finished: serial=" << nextMesh.serial
+                   << " points=" << (nextMesh.pointCount > 0 ? nextMesh.pointCount : (nextMesh.pointVerts.size() / 3u))
+                   << " transform=" << nextMesh.transformBackendLabel
+                   << " pack=" << nextMesh.packBackendLabel
+                   << " renderOk=" << (nextMesh.renderOk ? "1" : "0");
+                logViewerEvent(os.str());
+              }
               mesh = std::move(nextMesh);
             } else {
               // Keep last displayed mesh until an input_cloud payload arrives.
