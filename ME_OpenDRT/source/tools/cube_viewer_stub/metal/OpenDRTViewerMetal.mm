@@ -801,7 +801,9 @@ bool buildIdentityMesh(
 
       OpenDRTProcessor proc(params);
       const size_t rowBytes = pointCount * 4u * sizeof(float);
-      const bool ok = proc.renderMetalHostBuffers(
+      std::vector<float> readbackSrc(pointCount * 4u, 0.0f);
+      std::vector<float> readbackDst(pointCount * 4u, 0.0f);
+      const bool ok = proc.renderMetalHostBuffersReadback(
           (__bridge const void*)impl->srcBuffer,
           (__bridge void*)impl->dstBuffer,
           static_cast<int>(pointCount),
@@ -810,22 +812,24 @@ bool buildIdentityMesh(
           rowBytes,
           0,
           0,
-          (__bridge void*)context().queue);
+          (__bridge void*)context().queue,
+          readbackSrc.data(),
+          rowBytes,
+          readbackDst.data(),
+          rowBytes);
       if (!ok) {
-        if (errorOut) *errorOut = "OpenDRT Metal host render failed";
+        if (errorOut) *errorOut = "OpenDRT Metal host readback render failed";
         return false;
       }
 
       if (transformBackendLabel) *transformBackendLabel = proc.lastBackendLabel();
       if (maxDelta) {
-        const float* src = reinterpret_cast<const float*>([impl->srcBuffer contents]);
-        const float* dst = reinterpret_cast<const float*>([impl->dstBuffer contents]);
         float localMax = 0.0f;
         for (size_t i = 0; i < pointCount; ++i) {
           const size_t si = i * 4u;
-          localMax = std::max(localMax, std::fabs(dst[si + 0] - src[si + 0]));
-          localMax = std::max(localMax, std::fabs(dst[si + 1] - src[si + 1]));
-          localMax = std::max(localMax, std::fabs(dst[si + 2] - src[si + 2]));
+          localMax = std::max(localMax, std::fabs(readbackDst[si + 0] - readbackSrc[si + 0]));
+          localMax = std::max(localMax, std::fabs(readbackDst[si + 1] - readbackSrc[si + 1]));
+          localMax = std::max(localMax, std::fabs(readbackDst[si + 2] - readbackSrc[si + 2]));
         }
         *maxDelta = localMax;
       }
