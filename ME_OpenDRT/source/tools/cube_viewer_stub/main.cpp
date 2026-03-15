@@ -2471,6 +2471,10 @@ struct AppState {
   std::string currentSourceMode = "identity";
   std::string currentSenderId;
   std::string lastDrawSourceLabel;
+  bool hasActiveParams = false;
+  bool hasActiveInputCloud = false;
+  ResolvedPayload activeParams;
+  InputCloudPayload activeInputCloud;
   double lastX = 0.0;
   double lastY = 0.0;
   double lastClick = -10.0;
@@ -2858,6 +2862,8 @@ int runApp() {
             logViewerEvent("Ignored stale params sequence.");
           } else {
             lastParamsSeq = rp.seq;
+            app.activeParams = rp;
+            app.hasActiveParams = true;
             const std::string prevSourceMode = app.currentSourceMode;
             app.keepOnTop = (rp.alwaysOnTop != 0);
             app.currentSourceMode = rp.sourceMode;
@@ -2950,8 +2956,12 @@ int runApp() {
           } else if (app.currentSourceMode != "input") {
             deferredCloud = cp;
             hasDeferredCloud = true;
+            app.activeInputCloud = cp;
+            app.hasActiveInputCloud = true;
             logViewerEvent("Deferred input cloud until params confirm input mode.");
           } else {
+            app.activeInputCloud = cp;
+            app.hasActiveInputCloud = true;
             MeshData nextMesh{};
             if (buildInputCloudMesh(cp, app.gpuCaps, &app.runtime, &inputCloudComputeCache,
 #if defined(__APPLE__)
@@ -3064,6 +3074,62 @@ int runApp() {
             1.0f,
             &renderError)) {
       logViewerEvent(std::string("Metal render failed: ") + renderError);
+      const bool hadPointSource = pointCount > 0u;
+      bool attemptedRecovery = false;
+      bool rebuiltCpuMesh = false;
+      if (hadPointSource) {
+        MeshData recoveredMesh{};
+        if (app.currentSourceMode == "input" && app.hasActiveInputCloud && !app.runtime.inputGpuDemoted) {
+          app.runtime.inputGpuDemoted = true;
+          app.runtime.inputDemotionReason = "metal-render-failure";
+          logViewerEvent("Input Metal path demoted after render failure; retrying with CPU mesh.");
+          attemptedRecovery = true;
+          if (buildInputCloudMesh(app.activeInputCloud, app.gpuCaps, &app.runtime, &inputCloudComputeCache,
+#if defined(__APPLE__)
+                                  &inputMetalCache,
+#endif
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+                                  &inputCudaCache,
+#endif
+                                  &recoveredMesh)) {
+            mesh = std::move(recoveredMesh);
+            rebuiltCpuMesh = true;
+          }
+        } else if (app.currentSourceMode != "input" && app.hasActiveParams && !app.runtime.identityGpuDemoted) {
+          app.runtime.identityGpuDemoted = true;
+          app.runtime.identityDemotionReason = "metal-render-failure";
+          logViewerEvent("Identity Metal path demoted after render failure; retrying with CPU mesh.");
+          attemptedRecovery = true;
+          buildCubeData(app.activeParams, app.gpuCaps, &app.runtime, &identityComputeCache,
+#if defined(__APPLE__)
+                        &identityMetalCache,
+#endif
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+                        &identityCudaCache,
+#endif
+                        &recoveredMesh);
+          rebuiltCpuMesh = (recoveredMesh.pointCount > 0u || !recoveredMesh.pointVerts.empty());
+          if (rebuiltCpuMesh) {
+            mesh = std::move(recoveredMesh);
+          }
+        }
+
+        if (rebuiltCpuMesh) {
+          logViewerEvent("Recovered from Metal render failure with CPU mesh fallback; continuing session.");
+          continue;
+        }
+
+        if (attemptedRecovery) {
+          logViewerEvent("Metal render recovery did not rebuild a drawable mesh; clearing cloud and keeping viewer alive.");
+        } else {
+          logViewerEvent("Metal render failed after prior demotion; clearing cloud and keeping viewer alive.");
+        }
+        mesh.pointVerts.clear();
+        mesh.pointColors.clear();
+        mesh.pointCount = 0u;
+        mesh.packBackendLabel = "none";
+        continue;
+      }
       gRun.store(false);
     }
 #else
@@ -3283,4 +3349,3 @@ int main() {
   return runApp();
 }
 #endif
-
