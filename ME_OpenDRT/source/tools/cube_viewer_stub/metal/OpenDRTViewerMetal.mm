@@ -708,6 +708,18 @@ void releaseCacheImpl(CacheImpl* impl) {
   delete impl;
 }
 
+std::string describeException(NSException* ex, const char* fallback) {
+  if (ex == nil) return fallback ? std::string(fallback) : std::string("unknown NSException");
+  const char* name = [[ex name] UTF8String];
+  const char* reason = [[ex reason] UTF8String];
+  std::string message = name ? std::string(name) : std::string("NSException");
+  if (reason && reason[0] != '\0') {
+    message += ": ";
+    message += reason;
+  }
+  return message;
+}
+
 }  // namespace
 
 namespace OpenDRTViewerMetal {
@@ -768,89 +780,94 @@ bool buildIdentityMesh(
     float* maxDelta,
     std::string* errorOut) {
   if (!cache || resolution <= 1) return false;
-  std::string initError;
-  if (!ensureBaseContext(&initError)) {
-    if (errorOut) *errorOut = initError;
-    return false;
-  }
-
-  const int res = resolution <= 25 ? 25 : (resolution <= 41 ? 41 : 57);
-  const size_t pointCount = static_cast<size_t>(res) * static_cast<size_t>(res) * static_cast<size_t>(res);
-  const int interiorStep = (res <= 25) ? 2 : (res <= 41 ? 2 : 3);
-  CacheImpl* impl = ensureImpl(cache);
-  if (!impl) return false;
-  if (!ensureIdentityCapacity(impl, pointCount, errorOut) || !ensureMeshCapacity(impl, pointCount, errorOut)) return false;
-  if (!computeIdentityLattice(impl->srcBuffer, res)) {
-    if (errorOut) *errorOut = "Failed to build Metal identity lattice";
-    return false;
-  }
-
-  OpenDRTProcessor proc(params);
-  const size_t rowBytes = pointCount * 4u * sizeof(float);
-  const bool ok = proc.renderMetalHostBuffers(
-      (__bridge const void*)impl->srcBuffer,
-      (__bridge void*)impl->dstBuffer,
-      static_cast<int>(pointCount),
-      1,
-      rowBytes,
-      rowBytes,
-      0,
-      0,
-      (__bridge void*)context().queue);
-  if (!ok) {
-    if (errorOut) *errorOut = "OpenDRT Metal host render failed";
-    return false;
-  }
-
-  if (transformBackendLabel) *transformBackendLabel = proc.lastBackendLabel();
-  if (maxDelta) {
-    const float* src = reinterpret_cast<const float*>([impl->srcBuffer contents]);
-    const float* dst = reinterpret_cast<const float*>([impl->dstBuffer contents]);
-    float localMax = 0.0f;
-    for (size_t i = 0; i < pointCount; ++i) {
-      const size_t si = i * 4u;
-      localMax = std::max(localMax, std::fabs(dst[si + 0] - src[si + 0]));
-      localMax = std::max(localMax, std::fabs(dst[si + 1] - src[si + 1]));
-      localMax = std::max(localMax, std::fabs(dst[si + 2] - src[si + 2]));
-    }
-    *maxDelta = localMax;
-  }
-
-  IdentityUniforms uniforms{};
-  uniforms.resolution = static_cast<uint32_t>(res);
-  uniforms.interiorStep = static_cast<uint32_t>(interiorStep);
-  uniforms.showOverflow = showOverflow ? 1u : 0u;
-  uniforms.highlightOverflow = highlightOverflow ? 1u : 0u;
-  std::memcpy([impl->uniformBuffer contents], &uniforms, sizeof(uniforms));
-  std::memset([impl->counterBuffer contents], 0, sizeof(uint32_t));
-
-  MetalViewerContext& ctx = context();
   @autoreleasepool {
-    id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
-    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
-    if (encoder == nil) {
-      if (errorOut) *errorOut = "Metal identity encoder unavailable";
+    @try {
+      std::string initError;
+      if (!ensureBaseContext(&initError)) {
+        if (errorOut) *errorOut = initError;
+        return false;
+      }
+
+      const int res = resolution <= 25 ? 25 : (resolution <= 41 ? 41 : 57);
+      const size_t pointCount = static_cast<size_t>(res) * static_cast<size_t>(res) * static_cast<size_t>(res);
+      const int interiorStep = (res <= 25) ? 2 : (res <= 41 ? 2 : 3);
+      CacheImpl* impl = ensureImpl(cache);
+      if (!impl) return false;
+      if (!ensureIdentityCapacity(impl, pointCount, errorOut) || !ensureMeshCapacity(impl, pointCount, errorOut)) return false;
+      if (!computeIdentityLattice(impl->srcBuffer, res)) {
+        if (errorOut) *errorOut = "Failed to build Metal identity lattice";
+        return false;
+      }
+
+      OpenDRTProcessor proc(params);
+      const size_t rowBytes = pointCount * 4u * sizeof(float);
+      const bool ok = proc.renderMetalHostBuffers(
+          (__bridge const void*)impl->srcBuffer,
+          (__bridge void*)impl->dstBuffer,
+          static_cast<int>(pointCount),
+          1,
+          rowBytes,
+          rowBytes,
+          0,
+          0,
+          (__bridge void*)context().queue);
+      if (!ok) {
+        if (errorOut) *errorOut = "OpenDRT Metal host render failed";
+        return false;
+      }
+
+      if (transformBackendLabel) *transformBackendLabel = proc.lastBackendLabel();
+      if (maxDelta) {
+        const float* src = reinterpret_cast<const float*>([impl->srcBuffer contents]);
+        const float* dst = reinterpret_cast<const float*>([impl->dstBuffer contents]);
+        float localMax = 0.0f;
+        for (size_t i = 0; i < pointCount; ++i) {
+          const size_t si = i * 4u;
+          localMax = std::max(localMax, std::fabs(dst[si + 0] - src[si + 0]));
+          localMax = std::max(localMax, std::fabs(dst[si + 1] - src[si + 1]));
+          localMax = std::max(localMax, std::fabs(dst[si + 2] - src[si + 2]));
+        }
+        *maxDelta = localMax;
+      }
+
+      IdentityUniforms uniforms{};
+      uniforms.resolution = static_cast<uint32_t>(res);
+      uniforms.interiorStep = static_cast<uint32_t>(interiorStep);
+      uniforms.showOverflow = showOverflow ? 1u : 0u;
+      uniforms.highlightOverflow = highlightOverflow ? 1u : 0u;
+      std::memcpy([impl->uniformBuffer contents], &uniforms, sizeof(uniforms));
+      std::memset([impl->counterBuffer contents], 0, sizeof(uint32_t));
+
+      MetalViewerContext& ctx = context();
+      id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
+      id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+      if (encoder == nil) {
+        if (errorOut) *errorOut = "Metal identity encoder unavailable";
+        return false;
+      }
+      [encoder setComputePipelineState:ctx.identityPipeline];
+      [encoder setBuffer:impl->srcBuffer offset:0 atIndex:0];
+      [encoder setBuffer:impl->dstBuffer offset:0 atIndex:1];
+      [encoder setBuffer:impl->vertsBuffer offset:0 atIndex:2];
+      [encoder setBuffer:impl->colorsBuffer offset:0 atIndex:3];
+      [encoder setBuffer:impl->counterBuffer offset:0 atIndex:4];
+      [encoder setBuffer:impl->uniformBuffer offset:0 atIndex:5];
+      const NSUInteger threadWidth = std::max<NSUInteger>(1u, ctx.identityPipeline.threadExecutionWidth);
+      [encoder dispatchThreads:MTLSizeMake(pointCount, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(threadWidth, 1, 1)];
+      [encoder endEncoding];
+      if (!finishCommandBuffer(commandBuffer, errorOut)) return false;
+
+      const uint32_t writtenPoints = *reinterpret_cast<const uint32_t*>([impl->counterBuffer contents]);
+      cache->builtSerial = serial;
+      cache->pointCount = static_cast<int>(writtenPoints);
+      cache->available = (writtenPoints > 0u);
+      return true;
+    } @catch (NSException* ex) {
+      if (errorOut) *errorOut = std::string("Metal identity mesh exception: ") + describeException(ex, "identity build exception");
       return false;
     }
-    [encoder setComputePipelineState:ctx.identityPipeline];
-    [encoder setBuffer:impl->srcBuffer offset:0 atIndex:0];
-    [encoder setBuffer:impl->dstBuffer offset:0 atIndex:1];
-    [encoder setBuffer:impl->vertsBuffer offset:0 atIndex:2];
-    [encoder setBuffer:impl->colorsBuffer offset:0 atIndex:3];
-    [encoder setBuffer:impl->counterBuffer offset:0 atIndex:4];
-    [encoder setBuffer:impl->uniformBuffer offset:0 atIndex:5];
-    const NSUInteger threadWidth = std::max<NSUInteger>(1u, ctx.identityPipeline.threadExecutionWidth);
-    [encoder dispatchThreads:MTLSizeMake(pointCount, 1, 1)
-      threadsPerThreadgroup:MTLSizeMake(threadWidth, 1, 1)];
-    [encoder endEncoding];
-    if (!finishCommandBuffer(commandBuffer, errorOut)) return false;
   }
-
-  const uint32_t writtenPoints = *reinterpret_cast<const uint32_t*>([impl->counterBuffer contents]);
-  cache->builtSerial = serial;
-  cache->pointCount = static_cast<int>(writtenPoints);
-  cache->available = (writtenPoints > 0u);
-  return true;
 }
 
 bool buildInputCloudMesh(
@@ -863,47 +880,52 @@ bool buildInputCloudMesh(
     std::string* errorOut) {
   if (!cache || !rawPoints) return false;
   if (rawPointFloatCount == 0u || (rawPointFloatCount % 6u) != 0u) return false;
-  std::string initError;
-  if (!ensureBaseContext(&initError)) {
-    if (errorOut) *errorOut = initError;
-    return false;
-  }
-
-  const size_t pointCount = rawPointFloatCount / 6u;
-  CacheImpl* impl = ensureImpl(cache);
-  if (!impl) return false;
-  if (!ensureInputCapacity(impl, rawPointFloatCount, errorOut) || !ensureMeshCapacity(impl, pointCount, errorOut)) return false;
-  std::memcpy([impl->inputBuffer contents], rawPoints, rawPointFloatCount * sizeof(float));
-  InputUniforms uniforms{};
-  uniforms.pointCount = static_cast<uint32_t>(pointCount);
-  uniforms.showOverflow = showOverflow ? 1u : 0u;
-  uniforms.highlightOverflow = highlightOverflow ? 1u : 0u;
-  std::memcpy([impl->uniformBuffer contents], &uniforms, sizeof(uniforms));
-
-  MetalViewerContext& ctx = context();
   @autoreleasepool {
-    id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
-    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
-    if (encoder == nil) {
-      if (errorOut) *errorOut = "Metal input encoder unavailable";
+    @try {
+      std::string initError;
+      if (!ensureBaseContext(&initError)) {
+        if (errorOut) *errorOut = initError;
+        return false;
+      }
+
+      const size_t pointCount = rawPointFloatCount / 6u;
+      CacheImpl* impl = ensureImpl(cache);
+      if (!impl) return false;
+      if (!ensureInputCapacity(impl, rawPointFloatCount, errorOut) || !ensureMeshCapacity(impl, pointCount, errorOut)) return false;
+      std::memcpy([impl->inputBuffer contents], rawPoints, rawPointFloatCount * sizeof(float));
+      InputUniforms uniforms{};
+      uniforms.pointCount = static_cast<uint32_t>(pointCount);
+      uniforms.showOverflow = showOverflow ? 1u : 0u;
+      uniforms.highlightOverflow = highlightOverflow ? 1u : 0u;
+      std::memcpy([impl->uniformBuffer contents], &uniforms, sizeof(uniforms));
+
+      MetalViewerContext& ctx = context();
+      id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
+      id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+      if (encoder == nil) {
+        if (errorOut) *errorOut = "Metal input encoder unavailable";
+        return false;
+      }
+      [encoder setComputePipelineState:ctx.inputPipeline];
+      [encoder setBuffer:impl->inputBuffer offset:0 atIndex:0];
+      [encoder setBuffer:impl->vertsBuffer offset:0 atIndex:1];
+      [encoder setBuffer:impl->colorsBuffer offset:0 atIndex:2];
+      [encoder setBuffer:impl->uniformBuffer offset:0 atIndex:3];
+      const NSUInteger threadWidth = std::max<NSUInteger>(1u, ctx.inputPipeline.threadExecutionWidth);
+      [encoder dispatchThreads:MTLSizeMake(pointCount, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(threadWidth, 1, 1)];
+      [encoder endEncoding];
+      if (!finishCommandBuffer(commandBuffer, errorOut)) return false;
+
+      cache->builtSerial = serial;
+      cache->pointCount = static_cast<int>(pointCount);
+      cache->available = (pointCount > 0u);
+      return true;
+    } @catch (NSException* ex) {
+      if (errorOut) *errorOut = std::string("Metal input mesh exception: ") + describeException(ex, "input build exception");
       return false;
     }
-    [encoder setComputePipelineState:ctx.inputPipeline];
-    [encoder setBuffer:impl->inputBuffer offset:0 atIndex:0];
-    [encoder setBuffer:impl->vertsBuffer offset:0 atIndex:1];
-    [encoder setBuffer:impl->colorsBuffer offset:0 atIndex:2];
-    [encoder setBuffer:impl->uniformBuffer offset:0 atIndex:3];
-    const NSUInteger threadWidth = std::max<NSUInteger>(1u, ctx.inputPipeline.threadExecutionWidth);
-    [encoder dispatchThreads:MTLSizeMake(pointCount, 1, 1)
-      threadsPerThreadgroup:MTLSizeMake(threadWidth, 1, 1)];
-    [encoder endEncoding];
-    if (!finishCommandBuffer(commandBuffer, errorOut)) return false;
   }
-
-  cache->builtSerial = serial;
-  cache->pointCount = static_cast<int>(pointCount);
-  cache->available = (pointCount > 0u);
-  return true;
 }
 
 bool resolveDrawSource(const MeshCache* cache, DrawSource* out) {
@@ -943,123 +965,127 @@ bool renderScene(GLFWwindow* window,
   MetalViewerContext& ctx = context();
 
   @autoreleasepool {
-    NSWindow* cocoaWindow = glfwGetCocoaWindow(window);
-    NSView* contentView = cocoaWindow ? [cocoaWindow contentView] : nil;
-    if (contentView == nil) {
-      if (errorOut) *errorOut = "Cocoa content view unavailable";
-      return false;
-    }
-    const CGFloat scale = [cocoaWindow backingScaleFactor];
-    const NSSize bounds = [contentView bounds].size;
-    ctx.layer.contentsScale = scale;
-    ctx.layer.drawableSize = CGSizeMake(bounds.width * scale, bounds.height * scale);
+    @try {
+      NSWindow* cocoaWindow = glfwGetCocoaWindow(window);
+      NSView* contentView = cocoaWindow ? [cocoaWindow contentView] : nil;
+      if (contentView == nil) {
+        if (errorOut) *errorOut = "Cocoa content view unavailable";
+        return false;
+      }
+      const CGFloat scale = [cocoaWindow backingScaleFactor];
+      const NSSize bounds = [contentView bounds].size;
+      ctx.layer.contentsScale = scale;
+      ctx.layer.drawableSize = CGSizeMake(bounds.width * scale, bounds.height * scale);
 
-    id<CAMetalDrawable> drawable = [ctx.layer nextDrawable];
-    if (drawable == nil) {
-      if (errorOut) *errorOut = "Metal drawable unavailable";
-      return false;
-    }
-    if (!ensureDepthTextureForDrawable(drawable, errorOut)) return false;
+      id<CAMetalDrawable> drawable = [ctx.layer nextDrawable];
+      if (drawable == nil) {
+        if (errorOut) *errorOut = "Metal drawable unavailable";
+        return false;
+      }
+      if (!ensureDepthTextureForDrawable(drawable, errorOut)) return false;
 
-    MTLRenderPassDescriptor* renderPass = [MTLRenderPassDescriptor renderPassDescriptor];
-    renderPass.colorAttachments[0].texture = drawable.texture;
-    renderPass.colorAttachments[0].loadAction = MTLLoadActionClear;
-    renderPass.colorAttachments[0].storeAction = MTLStoreActionStore;
-    renderPass.colorAttachments[0].clearColor = MTLClearColorMake(clearR, clearG, clearB, clearA);
-    renderPass.depthAttachment.texture = ctx.depthTexture;
-    renderPass.depthAttachment.loadAction = MTLLoadActionClear;
-    renderPass.depthAttachment.storeAction = MTLStoreActionDontCare;
-    renderPass.depthAttachment.clearDepth = 1.0;
+      MTLRenderPassDescriptor* renderPass = [MTLRenderPassDescriptor renderPassDescriptor];
+      renderPass.colorAttachments[0].texture = drawable.texture;
+      renderPass.colorAttachments[0].loadAction = MTLLoadActionClear;
+      renderPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+      renderPass.colorAttachments[0].clearColor = MTLClearColorMake(clearR, clearG, clearB, clearA);
+      renderPass.depthAttachment.texture = ctx.depthTexture;
+      renderPass.depthAttachment.loadAction = MTLLoadActionClear;
+      renderPass.depthAttachment.storeAction = MTLStoreActionDontCare;
+      renderPass.depthAttachment.clearDepth = 1.0;
 
-    id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
-    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPass];
-    if (encoder == nil) {
-      if (errorOut) *errorOut = "Metal render encoder unavailable";
-      return false;
-    }
-    [encoder setDepthStencilState:ctx.depthState];
-    [encoder setCullMode:MTLCullModeNone];
+      id<MTLCommandBuffer> commandBuffer = [ctx.queue commandBuffer];
+      id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPass];
+      if (encoder == nil) {
+        if (errorOut) *errorOut = "Metal render encoder unavailable";
+        return false;
+      }
+      [encoder setDepthStencilState:ctx.depthState];
+      [encoder setCullMode:MTLCullModeNone];
 
-    SceneUniforms scene{};
-    copySceneUniforms(mvp,
-                      &scene,
-                      1.0f,
-                      0.55f,
-                      static_cast<float>(ctx.layer.drawableSize.width),
-                      static_cast<float>(ctx.layer.drawableSize.height));
-    [encoder setRenderPipelineState:ctx.linePipeline];
-    [encoder setVertexBuffer:ctx.guideVerts offset:0 atIndex:0];
-    [encoder setVertexBuffer:ctx.guideColors offset:0 atIndex:1];
-    [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:2];
-    [encoder drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:24];
-    scene.alpha = 0.90f;
-    [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:2];
-    [encoder drawPrimitives:MTLPrimitiveTypeLine vertexStart:24 vertexCount:6];
-    scene.alpha = 0.38f;
-    [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:2];
-    [encoder drawPrimitives:MTLPrimitiveTypeLine vertexStart:30 vertexCount:2];
+      SceneUniforms scene{};
+      copySceneUniforms(mvp,
+                        &scene,
+                        1.0f,
+                        0.55f,
+                        static_cast<float>(ctx.layer.drawableSize.width),
+                        static_cast<float>(ctx.layer.drawableSize.height));
+      [encoder setRenderPipelineState:ctx.linePipeline];
+      [encoder setVertexBuffer:ctx.guideVerts offset:0 atIndex:0];
+      [encoder setVertexBuffer:ctx.guideColors offset:0 atIndex:1];
+      [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:2];
+      [encoder drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:24];
+      scene.alpha = 0.90f;
+      [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:2];
+      [encoder drawPrimitives:MTLPrimitiveTypeLine vertexStart:24 vertexCount:6];
+      scene.alpha = 0.38f;
+      [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:2];
+      [encoder drawPrimitives:MTLPrimitiveTypeLine vertexStart:30 vertexCount:2];
 
-    if (source.pointCount > 0) {
-      id<MTLBuffer> vertsBuffer = nil;
-      id<MTLBuffer> colorsBuffer = nil;
-      if (source.gpuBacked) {
-        vertsBuffer = (__bridge id<MTLBuffer>)source.vertsHandle;
-        colorsBuffer = (__bridge id<MTLBuffer>)source.colorsHandle;
-      } else if (source.cpuVerts && source.cpuColors) {
-        vertsBuffer = [ctx.device newBufferWithBytes:source.cpuVerts
-                                              length:static_cast<NSUInteger>(source.pointCount) * 3u * sizeof(float)
-                                             options:MTLResourceStorageModeShared];
-        colorsBuffer = [ctx.device newBufferWithBytes:source.cpuColors
-                                               length:static_cast<NSUInteger>(source.pointCount) * 3u * sizeof(float)
-                                              options:MTLResourceStorageModeShared];
+      if (source.pointCount > 0) {
+        id<MTLBuffer> vertsBuffer = nil;
+        id<MTLBuffer> colorsBuffer = nil;
+        if (source.gpuBacked) {
+          vertsBuffer = (__bridge id<MTLBuffer>)source.vertsHandle;
+          colorsBuffer = (__bridge id<MTLBuffer>)source.colorsHandle;
+        } else if (source.cpuVerts && source.cpuColors) {
+          vertsBuffer = [ctx.device newBufferWithBytes:source.cpuVerts
+                                                length:static_cast<NSUInteger>(source.pointCount) * 3u * sizeof(float)
+                                               options:MTLResourceStorageModeShared];
+          colorsBuffer = [ctx.device newBufferWithBytes:source.cpuColors
+                                                 length:static_cast<NSUInteger>(source.pointCount) * 3u * sizeof(float)
+                                                options:MTLResourceStorageModeShared];
+        }
+
+        if (vertsBuffer != nil && colorsBuffer != nil) {
+          copySceneUniforms(mvp,
+                            &scene,
+                            pointSize,
+                            1.0f,
+                            static_cast<float>(ctx.layer.drawableSize.width),
+                            static_cast<float>(ctx.layer.drawableSize.height));
+          [encoder setRenderPipelineState:ctx.pointColorPipeline];
+          [encoder setVertexBuffer:vertsBuffer offset:0 atIndex:0];
+          [encoder setVertexBuffer:colorsBuffer offset:0 atIndex:1];
+          [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:2];
+          [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                      vertexStart:0
+                      vertexCount:4
+                    instanceCount:source.pointCount];
+
+          SolidColorUniforms solid{};
+          solid.color[0] = 0.95f;
+          solid.color[1] = 0.96f;
+          solid.color[2] = 1.0f;
+          solid.color[3] = 0.05f;
+          copySceneUniforms(mvp,
+                            &scene,
+                            fillPointSize,
+                            1.0f,
+                            static_cast<float>(ctx.layer.drawableSize.width),
+                            static_cast<float>(ctx.layer.drawableSize.height));
+          [encoder setDepthStencilState:nil];
+          [encoder setRenderPipelineState:ctx.pointSolidPipeline];
+          [encoder setVertexBuffer:vertsBuffer offset:0 atIndex:0];
+          [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:2];
+          [encoder setFragmentBytes:&solid length:sizeof(solid) atIndex:0];
+          [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                      vertexStart:0
+                      vertexCount:4
+                    instanceCount:source.pointCount];
+          [encoder setDepthStencilState:ctx.depthState];
+        }
       }
 
-      if (vertsBuffer != nil && colorsBuffer != nil) {
-        copySceneUniforms(mvp,
-                          &scene,
-                          pointSize,
-                          1.0f,
-                          static_cast<float>(ctx.layer.drawableSize.width),
-                          static_cast<float>(ctx.layer.drawableSize.height));
-        [encoder setRenderPipelineState:ctx.pointColorPipeline];
-        [encoder setVertexBuffer:vertsBuffer offset:0 atIndex:0];
-        [encoder setVertexBuffer:colorsBuffer offset:0 atIndex:1];
-        [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:2];
-        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
-                    vertexStart:0
-                    vertexCount:4
-                  instanceCount:source.pointCount];
-
-        SolidColorUniforms solid{};
-        solid.color[0] = 0.95f;
-        solid.color[1] = 0.96f;
-        solid.color[2] = 1.0f;
-        solid.color[3] = 0.05f;
-        copySceneUniforms(mvp,
-                          &scene,
-                          fillPointSize,
-                          1.0f,
-                          static_cast<float>(ctx.layer.drawableSize.width),
-                          static_cast<float>(ctx.layer.drawableSize.height));
-        [encoder setDepthStencilState:nil];
-        [encoder setRenderPipelineState:ctx.pointSolidPipeline];
-        [encoder setVertexBuffer:vertsBuffer offset:0 atIndex:0];
-        [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:2];
-        [encoder setFragmentBytes:&solid length:sizeof(solid) atIndex:0];
-        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
-                    vertexStart:0
-                    vertexCount:4
-                  instanceCount:source.pointCount];
-        [encoder setDepthStencilState:ctx.depthState];
-      }
+      [encoder endEncoding];
+      [commandBuffer presentDrawable:drawable];
+      if (!finishCommandBuffer(commandBuffer, errorOut)) return false;
+      return true;
+    } @catch (NSException* ex) {
+      if (errorOut) *errorOut = std::string("Metal render exception: ") + describeException(ex, "render exception");
+      return false;
     }
-
-    [encoder endEncoding];
-    [commandBuffer presentDrawable:drawable];
-    if (!finishCommandBuffer(commandBuffer, errorOut)) return false;
   }
-
-  return true;
 }
 
 }  // namespace OpenDRTViewerMetal
