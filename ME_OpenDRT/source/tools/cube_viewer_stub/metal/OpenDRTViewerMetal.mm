@@ -120,6 +120,10 @@ struct VSOut {
   float pointSize [[point_size]];
 };
 
+struct FSColorIn {
+  float4 color;
+};
+
 inline float clamp01(float v) {
   return clamp(v, 0.0f, 1.0f);
 }
@@ -265,11 +269,11 @@ vertex VSOut viewerSolidVertex(
   return out;
 }
 
-fragment float4 viewerColorFragment(VSOut in [[stage_in]]) {
+fragment float4 viewerColorFragment(FSColorIn in [[stage_in]]) {
   return in.color;
 }
 
-fragment float4 viewerSolidFragment(VSOut, constant SolidColorUniforms& solid [[buffer(0)]]) {
+fragment float4 viewerSolidFragment(constant SolidColorUniforms& solid [[buffer(0)]]) {
   return solid.color;
 }
 )MSL";
