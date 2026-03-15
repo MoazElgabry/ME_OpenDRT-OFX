@@ -794,33 +794,37 @@ bool buildIdentityMesh(
       CacheImpl* impl = ensureImpl(cache);
       if (!impl) return false;
       if (!ensureIdentityCapacity(impl, pointCount, errorOut) || !ensureMeshCapacity(impl, pointCount, errorOut)) return false;
-      if (!computeIdentityLattice(impl->srcBuffer, res)) {
-        if (errorOut) *errorOut = "Failed to build Metal identity lattice";
-        return false;
-      }
-
       OpenDRTProcessor proc(params);
       const size_t rowBytes = pointCount * 4u * sizeof(float);
-      std::vector<float> readbackSrc(pointCount * 4u, 0.0f);
-      std::vector<float> readbackDst(pointCount * 4u, 0.0f);
-      const bool ok = proc.renderMetalHostBuffersReadback(
-          (__bridge const void*)impl->srcBuffer,
-          (__bridge void*)impl->dstBuffer,
+      std::vector<float> readbackSrc(pointCount * 4u, 1.0f);
+      std::vector<float> readbackDst(pointCount * 4u, 1.0f);
+      const float denom = static_cast<float>(res - 1);
+      for (int z = 0; z < res; ++z) {
+        for (int y = 0; y < res; ++y) {
+          for (int x = 0; x < res; ++x) {
+            const size_t i = (static_cast<size_t>(z) * static_cast<size_t>(res) + static_cast<size_t>(y)) *
+                                 static_cast<size_t>(res) +
+                             static_cast<size_t>(x);
+            const size_t base = i * 4u;
+            readbackSrc[base + 0u] = static_cast<float>(x) / denom;
+            readbackSrc[base + 1u] = static_cast<float>(y) / denom;
+            readbackSrc[base + 2u] = static_cast<float>(z) / denom;
+          }
+        }
+      }
+      const bool ok = proc.render(
+          readbackSrc.data(),
+          readbackDst.data(),
           static_cast<int>(pointCount),
           1,
-          rowBytes,
-          rowBytes,
-          0,
-          0,
-          (__bridge void*)context().queue,
-          readbackSrc.data(),
-          rowBytes,
-          readbackDst.data(),
-          rowBytes);
+          true,
+          true);
       if (!ok) {
-        if (errorOut) *errorOut = "OpenDRT Metal host readback render failed";
+        if (errorOut) *errorOut = "OpenDRT Metal identity transform failed";
         return false;
       }
+      std::memcpy([impl->srcBuffer contents], readbackSrc.data(), rowBytes);
+      std::memcpy([impl->dstBuffer contents], readbackDst.data(), rowBytes);
 
       if (transformBackendLabel) *transformBackendLabel = proc.lastBackendLabel();
       if (maxDelta) {
