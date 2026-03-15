@@ -1914,16 +1914,17 @@ void buildCubeData(const ResolvedPayload& payload,
 #endif
 
 #if defined(__APPLE__)
+  // Keep the identity transform on Metal, but pack the mesh on CPU for the Apple presenter path.
+  // The dedicated Metal mesh builder has been the unstable stage; this preserves Metal math while
+  // avoiding the extra same-frame handoff that was taking the viewer down on the first identity build.
   if (gpuCaps.activeBackend == ViewerGpuBackend::MetalComputeMesh &&
-      !(runtime && runtime->identityGpuDemoted) &&
-      buildCubeDataOnMetal(payload, metalCache, &mesh)) {
-    mesh.packBackendLabel = "metal-compute-mesh";
-    *out = std::move(mesh);
-    return;
-  } else if (gpuCaps.activeBackend == ViewerGpuBackend::MetalComputeMesh && runtime && !runtime->identityGpuDemoted) {
-    runtime->identityGpuDemoted = true;
-    runtime->identityDemotionReason = "metal-runtime-failure";
-    logViewerEvent("Identity Metal path demoted to CPU after runtime failure.");
+      !(runtime && runtime->identityGpuDemoted)) {
+    ensureCpuTransformed();
+    if (runtime && mesh.transformBackendLabel != "metal") {
+      runtime->identityGpuDemoted = true;
+      runtime->identityDemotionReason = "metal-transform-fallback";
+      logViewerEvent("Identity Metal transform fell back; using CPU transform + Metal presenter path.");
+    }
   }
 #endif
 
@@ -2147,16 +2148,11 @@ bool buildInputCloudMesh(const InputCloudPayload& payload,
 #endif
 
 #if defined(__APPLE__)
+  // Input clouds are already pretransformed by the plugin. On Apple, keep the Metal presenter path
+  // but pack the incoming cloud on CPU until the Metal mesh builder is proven stable on first handoff.
   if (gpuCaps.activeBackend == ViewerGpuBackend::MetalComputeMesh &&
-      !(runtime && runtime->inputGpuDemoted) &&
-      buildInputCloudMeshOnMetal(payload, rawPoints, metalCache, &mesh)) {
-    mesh.packBackendLabel = "metal-compute-mesh";
-    *out = std::move(mesh);
-    return true;
-  } else if (gpuCaps.activeBackend == ViewerGpuBackend::MetalComputeMesh && runtime && !runtime->inputGpuDemoted) {
-    runtime->inputGpuDemoted = true;
-    runtime->inputDemotionReason = "metal-runtime-failure";
-    logViewerEvent("Input Metal path demoted to CPU after runtime failure.");
+      runtime && !runtime->inputGpuDemoted) {
+    runtime->inputDemotionReason = "metal-presenter-cpu-pack";
   }
 #endif
   const bool tryInputCompute =
