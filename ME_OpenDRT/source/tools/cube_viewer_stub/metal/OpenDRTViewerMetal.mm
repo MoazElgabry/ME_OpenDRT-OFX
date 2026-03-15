@@ -25,8 +25,9 @@ struct MetalViewerContext {
   id<MTLLibrary> library = nil;
   id<MTLComputePipelineState> identityPipeline = nil;
   id<MTLComputePipelineState> inputPipeline = nil;
-  id<MTLRenderPipelineState> colorPipeline = nil;
-  id<MTLRenderPipelineState> solidPipeline = nil;
+  id<MTLRenderPipelineState> linePipeline = nil;
+  id<MTLRenderPipelineState> pointColorPipeline = nil;
+  id<MTLRenderPipelineState> pointSolidPipeline = nil;
   id<MTLDepthStencilState> depthState = nil;
   CAMetalLayer* layer = nil;
   id<MTLBuffer> guideVerts = nil;
@@ -58,8 +59,8 @@ struct SceneUniforms {
   float mvp[16];
   float pointSize = 1.0f;
   float alpha = 1.0f;
-  float padding0 = 0.0f;
-  float padding1 = 0.0f;
+  float viewportWidth = 1.0f;
+  float viewportHeight = 1.0f;
 };
 
 struct SolidColorUniforms {
@@ -106,8 +107,8 @@ struct SceneUniforms {
   float4x4 mvp;
   float pointSize;
   float alpha;
-  float padding0;
-  float padding1;
+  float viewportWidth;
+  float viewportHeight;
 };
 
 struct SolidColorUniforms {
@@ -117,11 +118,16 @@ struct SolidColorUniforms {
 struct VSOut {
   float4 position [[position]];
   float4 color;
-  float pointSize [[point_size]];
 };
 
 struct FSColorIn {
   float4 color;
+};
+
+struct PointVSOut {
+  float4 position [[position]];
+  float4 color;
+  float2 uv;
 };
 
 inline float clamp01(float v) {
@@ -253,7 +259,6 @@ vertex VSOut viewerColorVertex(
   out.position = scene.mvp * float4(pos, 1.0);
   const float3 color = float3(colors[vid]);
   out.color = float4(color, scene.alpha);
-  out.pointSize = scene.pointSize;
   return out;
 }
 
@@ -265,7 +270,6 @@ vertex VSOut viewerSolidVertex(
   const float3 pos = float3(positions[vid]);
   out.position = scene.mvp * float4(pos, 1.0);
   out.color = float4(1.0);
-  out.pointSize = scene.pointSize;
   return out;
 }
 
@@ -276,15 +280,78 @@ fragment float4 viewerColorFragment(FSColorIn in [[stage_in]]) {
 fragment float4 viewerSolidFragment(constant SolidColorUniforms& solid [[buffer(0)]]) {
   return solid.color;
 }
+
+constant float2 kBillboardCorners[4] = {
+  float2(-1.0f, -1.0f),
+  float2( 1.0f, -1.0f),
+  float2(-1.0f,  1.0f),
+  float2( 1.0f,  1.0f)
+};
+
+inline float2 clipOffsetForCorner(float2 corner, float4 clipPos, constant SceneUniforms& scene) {
+  const float safeWidth = max(scene.viewportWidth, 1.0f);
+  const float safeHeight = max(scene.viewportHeight, 1.0f);
+  const float2 ndcPerPixel = float2(2.0f / safeWidth, 2.0f / safeHeight);
+  return corner * scene.pointSize * ndcPerPixel * clipPos.w;
+}
+
+vertex PointVSOut viewerPointColorVertex(
+    const device packed_float3* positions [[buffer(0)]],
+    const device packed_float3* colors [[buffer(1)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    uint vid [[vertex_id]],
+    uint iid [[instance_id]]) {
+  PointVSOut out;
+  const float2 corner = kBillboardCorners[vid & 3u];
+  const float3 pos = float3(positions[iid]);
+  const float4 clipPos = scene.mvp * float4(pos, 1.0);
+  const float2 clipOffset = clipOffsetForCorner(corner, clipPos, scene);
+  out.position = clipPos + float4(clipOffset, 0.0f, 0.0f);
+  out.color = float4(float3(colors[iid]), scene.alpha);
+  out.uv = corner;
+  return out;
+}
+
+vertex PointVSOut viewerPointSolidVertex(
+    const device packed_float3* positions [[buffer(0)]],
+    constant SceneUniforms& scene [[buffer(2)]],
+    uint vid [[vertex_id]],
+    uint iid [[instance_id]]) {
+  PointVSOut out;
+  const float2 corner = kBillboardCorners[vid & 3u];
+  const float3 pos = float3(positions[iid]);
+  const float4 clipPos = scene.mvp * float4(pos, 1.0);
+  const float2 clipOffset = clipOffsetForCorner(corner, clipPos, scene);
+  out.position = clipPos + float4(clipOffset, 0.0f, 0.0f);
+  out.color = float4(1.0f);
+  out.uv = corner;
+  return out;
+}
+
+fragment float4 viewerPointColorFragment(PointVSOut in [[stage_in]]) {
+  if (dot(in.uv, in.uv) > 1.0f) discard_fragment();
+  return in.color;
+}
+
+fragment float4 viewerPointSolidFragment(PointVSOut in [[stage_in]],
+                                         constant SolidColorUniforms& solid [[buffer(0)]]) {
+  if (dot(in.uv, in.uv) > 1.0f) discard_fragment();
+  return solid.color;
+}
 )MSL";
 
-void copySceneUniforms(const float* mvp, SceneUniforms* scene, float pointSize, float alpha) {
+void copySceneUniforms(const float* mvp,
+                      SceneUniforms* scene,
+                      float pointSize,
+                      float alpha,
+                      float viewportWidth,
+                      float viewportHeight) {
   if (!mvp || !scene) return;
   std::memcpy(scene->mvp, mvp, sizeof(scene->mvp));
   scene->pointSize = pointSize;
   scene->alpha = alpha;
-  scene->padding0 = 0.0f;
-  scene->padding1 = 0.0f;
+  scene->viewportWidth = viewportWidth;
+  scene->viewportHeight = viewportHeight;
 }
 
 bool computeIdentityLattice(id<MTLBuffer> buffer, int res) {
@@ -450,8 +517,14 @@ bool ensureBaseContext(std::string* errorOut) {
     id<MTLFunction> colorFragmentFn = [ctx.library newFunctionWithName:@"viewerColorFragment"];
     id<MTLFunction> solidVertexFn = [ctx.library newFunctionWithName:@"viewerSolidVertex"];
     id<MTLFunction> solidFragmentFn = [ctx.library newFunctionWithName:@"viewerSolidFragment"];
+    id<MTLFunction> pointColorVertexFn = [ctx.library newFunctionWithName:@"viewerPointColorVertex"];
+    id<MTLFunction> pointColorFragmentFn = [ctx.library newFunctionWithName:@"viewerPointColorFragment"];
+    id<MTLFunction> pointSolidVertexFn = [ctx.library newFunctionWithName:@"viewerPointSolidVertex"];
+    id<MTLFunction> pointSolidFragmentFn = [ctx.library newFunctionWithName:@"viewerPointSolidFragment"];
     if (identityFn == nil || inputFn == nil || colorVertexFn == nil || colorFragmentFn == nil ||
-        solidVertexFn == nil || solidFragmentFn == nil) {
+        solidVertexFn == nil || solidFragmentFn == nil ||
+        pointColorVertexFn == nil || pointColorFragmentFn == nil ||
+        pointSolidVertexFn == nil || pointSolidFragmentFn == nil) {
       ctx.initError = "Metal viewer shader functions unavailable";
       if (errorOut) *errorOut = ctx.initError;
       return false;
@@ -487,21 +560,34 @@ bool ensureBaseContext(std::string* errorOut) {
     colorDesc.fragmentFunction = colorFragmentFn;
     configureBlend(colorDesc.colorAttachments[0]);
     colorDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
-    ctx.colorPipeline = [ctx.device newRenderPipelineStateWithDescriptor:colorDesc error:&error];
-    if (ctx.colorPipeline == nil) {
+    ctx.linePipeline = [ctx.device newRenderPipelineStateWithDescriptor:colorDesc error:&error];
+    if (ctx.linePipeline == nil) {
       ctx.initError = error ? [[error localizedDescription] UTF8String] : "Metal color render pipeline creation failed";
       if (errorOut) *errorOut = ctx.initError;
       return false;
     }
 
     error = nil;
-    MTLRenderPipelineDescriptor* solidDesc = [[MTLRenderPipelineDescriptor alloc] init];
-    solidDesc.vertexFunction = solidVertexFn;
-    solidDesc.fragmentFunction = solidFragmentFn;
-    configureBlend(solidDesc.colorAttachments[0]);
-    solidDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
-    ctx.solidPipeline = [ctx.device newRenderPipelineStateWithDescriptor:solidDesc error:&error];
-    if (ctx.solidPipeline == nil) {
+    MTLRenderPipelineDescriptor* pointColorDesc = [[MTLRenderPipelineDescriptor alloc] init];
+    pointColorDesc.vertexFunction = pointColorVertexFn;
+    pointColorDesc.fragmentFunction = pointColorFragmentFn;
+    configureBlend(pointColorDesc.colorAttachments[0]);
+    pointColorDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    ctx.pointColorPipeline = [ctx.device newRenderPipelineStateWithDescriptor:pointColorDesc error:&error];
+    if (ctx.pointColorPipeline == nil) {
+      ctx.initError = error ? [[error localizedDescription] UTF8String] : "Metal point color render pipeline creation failed";
+      if (errorOut) *errorOut = ctx.initError;
+      return false;
+    }
+
+    error = nil;
+    MTLRenderPipelineDescriptor* pointSolidDesc = [[MTLRenderPipelineDescriptor alloc] init];
+    pointSolidDesc.vertexFunction = pointSolidVertexFn;
+    pointSolidDesc.fragmentFunction = pointSolidFragmentFn;
+    configureBlend(pointSolidDesc.colorAttachments[0]);
+    pointSolidDesc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+    ctx.pointSolidPipeline = [ctx.device newRenderPipelineStateWithDescriptor:pointSolidDesc error:&error];
+    if (ctx.pointSolidPipeline == nil) {
       ctx.initError = error ? [[error localizedDescription] UTF8String] : "Metal solid render pipeline creation failed";
       if (errorOut) *errorOut = ctx.initError;
       return false;
@@ -663,8 +749,9 @@ void shutdownPresenter() {
   ctx.layer = nil;
   ctx.guideVerts = nil;
   ctx.guideColors = nil;
-  ctx.colorPipeline = nil;
-  ctx.solidPipeline = nil;
+  ctx.linePipeline = nil;
+  ctx.pointColorPipeline = nil;
+  ctx.pointSolidPipeline = nil;
   ctx.depthState = nil;
   ctx.presenterReady = false;
   ctx.drawableSize = CGSizeZero;
@@ -894,8 +981,13 @@ bool renderScene(GLFWwindow* window,
     [encoder setCullMode:MTLCullModeNone];
 
     SceneUniforms scene{};
-    copySceneUniforms(mvp, &scene, 1.0f, 0.55f);
-    [encoder setRenderPipelineState:ctx.colorPipeline];
+    copySceneUniforms(mvp,
+                      &scene,
+                      1.0f,
+                      0.55f,
+                      static_cast<float>(ctx.layer.drawableSize.width),
+                      static_cast<float>(ctx.layer.drawableSize.height));
+    [encoder setRenderPipelineState:ctx.linePipeline];
     [encoder setVertexBuffer:ctx.guideVerts offset:0 atIndex:0];
     [encoder setVertexBuffer:ctx.guideColors offset:0 atIndex:1];
     [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:2];
@@ -923,25 +1015,42 @@ bool renderScene(GLFWwindow* window,
       }
 
       if (vertsBuffer != nil && colorsBuffer != nil) {
-        copySceneUniforms(mvp, &scene, pointSize, 1.0f);
-        [encoder setRenderPipelineState:ctx.colorPipeline];
+        copySceneUniforms(mvp,
+                          &scene,
+                          pointSize,
+                          1.0f,
+                          static_cast<float>(ctx.layer.drawableSize.width),
+                          static_cast<float>(ctx.layer.drawableSize.height));
+        [encoder setRenderPipelineState:ctx.pointColorPipeline];
         [encoder setVertexBuffer:vertsBuffer offset:0 atIndex:0];
         [encoder setVertexBuffer:colorsBuffer offset:0 atIndex:1];
         [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:2];
-        [encoder drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:source.pointCount];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                    vertexStart:0
+                    vertexCount:4
+                  instanceCount:source.pointCount];
 
         SolidColorUniforms solid{};
         solid.color[0] = 0.95f;
         solid.color[1] = 0.96f;
         solid.color[2] = 1.0f;
         solid.color[3] = 0.05f;
-        copySceneUniforms(mvp, &scene, fillPointSize, 1.0f);
+        copySceneUniforms(mvp,
+                          &scene,
+                          fillPointSize,
+                          1.0f,
+                          static_cast<float>(ctx.layer.drawableSize.width),
+                          static_cast<float>(ctx.layer.drawableSize.height));
         [encoder setDepthStencilState:nil];
-        [encoder setRenderPipelineState:ctx.solidPipeline];
+        [encoder setRenderPipelineState:ctx.pointSolidPipeline];
         [encoder setVertexBuffer:vertsBuffer offset:0 atIndex:0];
         [encoder setVertexBytes:&scene length:sizeof(scene) atIndex:2];
         [encoder setFragmentBytes:&solid length:sizeof(solid) atIndex:0];
-        [encoder drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:source.pointCount];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                    vertexStart:0
+                    vertexCount:4
+                  instanceCount:source.pointCount];
+        [encoder setDepthStencilState:ctx.depthState];
       }
     }
 
