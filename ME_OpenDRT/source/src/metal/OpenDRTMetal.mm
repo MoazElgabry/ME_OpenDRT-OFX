@@ -878,8 +878,8 @@ bool renderHostReadback(
     debugLog("Host Metal readback path temporarily disabled due to prior async errors.");
     return false;
   }
-  if (!ctx.initialized) {
-    debugLog("Host Metal readback requested before Metal context initialization.");
+  if (!initialize(hostQueue)) {
+    debugLog("Host Metal readback initialization failed.");
     return false;
   }
 
