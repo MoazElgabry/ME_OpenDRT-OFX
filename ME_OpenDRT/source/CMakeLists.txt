@@ -12,7 +12,8 @@ set(VIEWER_ICON_SVG "${SHARED_ICON_DIR}/OpenDRT_Cube.svg")
 # OpenDRT_Cube.svg matches the existing shared raster used for the LUT viewer icon.
 set(VIEWER_ICON_PNG "${SHARED_ICON_DIR}/Cube 2.png")
 set(GENERATED_ASSET_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
-option(ME_OPENDRT_LINUX_CUDA "Enable CUDA backend on Linux builds" ON)
+option(ME_OPENDRT_LINUX_CUDA "Enable CUDA backend in the Linux plugin build" ON)
+option(ME_OPENDRT_LINUX_VIEWER_CUDA "Enable CUDA interop path in the Linux cube viewer build" OFF)
 option(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB "Build cube-viewer transport stub (research)" ON)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -34,7 +35,9 @@ set(PLUGIN_SOURCES
   ${OFX_SUPPORT_SOURCES}
 )
 
+set(ME_OPENDRT_PLUGIN_USES_CUDA OFF)
 if(WIN32 OR (UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA))
+  set(ME_OPENDRT_PLUGIN_USES_CUDA ON)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -59,6 +62,13 @@ if(WIN32 OR (UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA))
   endif()
 
   list(APPEND PLUGIN_SOURCES src/cuda/OpenDRT.cu)
+endif()
+
+set(ME_OPENDRT_VIEWER_USES_CUDA OFF)
+if(WIN32)
+  set(ME_OPENDRT_VIEWER_USES_CUDA ON)
+elseif(UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA AND ME_OPENDRT_LINUX_VIEWER_CUDA)
+  set(ME_OPENDRT_VIEWER_USES_CUDA ON)
 endif()
 
 if(WIN32 OR (UNIX AND NOT APPLE))
@@ -111,7 +121,7 @@ target_compile_definitions(${PLUGIN_BASENAME} PRIVATE
   _CRT_SECURE_NO_WARNINGS
 )
 
-if(WIN32 OR (UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA))
+if(ME_OPENDRT_PLUGIN_USES_CUDA)
   target_compile_definitions(${PLUGIN_BASENAME} PRIVATE
     OFX_SUPPORTS_CUDARENDER
   )
@@ -284,7 +294,7 @@ if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
       tools/cube_viewer_stub/gl/OpenDRTViewerOpenGLPresenter.cpp
     )
   endif()
-  if(WIN32 OR (UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA))
+  if(ME_OPENDRT_VIEWER_USES_CUDA)
     list(APPEND ME_OPENDRT_VIEWER_SOURCES
       src/cuda/OpenDRT.cu
       tools/cube_viewer_stub/cuda/OpenDRTViewerCuda.cu
@@ -303,7 +313,7 @@ if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
     ${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk/Support/include
     $<$<BOOL:${OPENCL_KERNEL_HDR_DIR}>:${OPENCL_KERNEL_HDR_DIR}>
   )
-  if(WIN32 OR (UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA))
+  if(ME_OPENDRT_VIEWER_USES_CUDA)
     target_compile_definitions(ME_OpenDRT_CubeViewer PRIVATE OFX_SUPPORTS_CUDARENDER)
     target_include_directories(ME_OpenDRT_CubeViewer PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     set_target_properties(ME_OpenDRT_CubeViewer PROPERTIES

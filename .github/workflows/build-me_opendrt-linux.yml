@@ -1,4 +1,4 @@
-name: Build ME_OpenDRT Linux (x86_64 CUDA build with OpenCL/CPU fallback)
+name: Build ME_OpenDRT Linux (single x86_64 CUDA build with OpenCL/CPU fallback)
 
 on:
   workflow_dispatch:
@@ -34,6 +34,7 @@ jobs:
           cmake -S . -B build-linux -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DME_OPENDRT_LINUX_CUDA=ON \
+            -DME_OPENDRT_LINUX_VIEWER_CUDA=OFF \
             -DME_OPENDRT_BUILD_CUBE_VIEWER_STUB=ON
 
       - name: Build

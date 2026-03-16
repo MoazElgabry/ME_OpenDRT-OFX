@@ -26,7 +26,7 @@ Current plugin UI version: `v1.2.0`
 ## Host and Platform Support
 - Windows (x86_64): CUDA + OpenCL + CPU fallback
 - macOS (arm64 + x86_64): Metal + CPU fallback
-- Linux (x86_64): CUDA/OpenCL/CPU fallback chain (depends on build variant)
+- Linux (x86_64): single portable build with CUDA + OpenCL + CPU fallback
 
 ## Installation (End Users)
 1. Download the latest portable build artifact for your platform from the project releases/workflows.
@@ -70,6 +70,10 @@ cmake --build build --config Release
 cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build-linux -j
 ```
+
+Linux notes:
+- The default Linux build keeps the plugin CUDA-enabled and ships the OpenCL/CPU fallback chain in the same artifact.
+- The Linux cube viewer defaults to the OpenGL/OpenCL/CPU path in CI; enable `-DME_OPENDRT_LINUX_VIEWER_CUDA=ON` only if your local CUDA toolchain is known to compile the viewer interop path cleanly.
 
 ### macOS
 ```bash
