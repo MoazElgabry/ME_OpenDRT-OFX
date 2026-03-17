@@ -27,3 +27,9 @@ ME_OpenDRT/source/installer/*.exe
 # macOS metadata
 **/.AppleDouble
 **/._*
+
+# MoazElgabryPluginManager
+MoazElgabryPluginManager/node_modules/
+MoazElgabryPluginManager/dist/
+MoazElgabryPluginManager/src-tauri/target/
+MoazElgabryPluginManager/src-tauri/gen/
