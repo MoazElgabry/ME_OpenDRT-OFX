@@ -6,7 +6,7 @@ and design the DRT aspects according to their projects and stories. I've built a
 that makes it easy to store and share configurations to give the colorist both flexibility and speed. 
 
 Current plugin in this repo:
-- **ME_OpenDRT OFX v1.2.2** (A direct port from OpenDRT v1.1.0)
+- **ME_OpenDRT OFX v1.2.11** (A direct port from OpenDRT v1.1.0)
 
 ## Upstream Project and License
 This project is based on OpenDRT and is distributed under **GNU GPL v3**.
@@ -15,7 +15,7 @@ This project is based on OpenDRT and is distributed under **GNU GPL v3**.
 ## Current Platform Status
 - Windows (x86_64): CUDA + OpenCL + CPU, including host-CUDA path.
 - macOS (arm64 + x86_64): Metal + CPU, including host-Metal path.
-- Linux (x86_64): CUDA/OpenCL/CPU fallback chain (build depends on toolkit availability and workflow variant).
+- Linux (x86_64): CUDA/OpenCL/CPU fallback chain.
 
 
 ## Installation
@@ -34,9 +34,6 @@ On Mac, the plugin folder might be hidden. An easy way to access it is:
 `/Library/OFX/Plugins/`
 -Press Enter.
 
-Architecture mapping:
-- Apple Silicon (M1/M2/M3/M4): `ME_OpenDRT-macos-arm64`
-- Intel Mac: `ME_OpenDRT-macos-x86_64`
 
 ## Installation on windows
 Use the installer or copy the content of the Windows build to `C:\Program Files\Common Files\OFX\Plugins\`
