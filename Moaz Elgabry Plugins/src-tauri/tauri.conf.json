@@ -27,16 +27,6 @@
       ]
     }
   },
-  "plugins": {
-    "updater": {
-      "endpoints": [
-        "https://moazelgabry.github.io/MoazElgabryPluginManager/updates/latest.json"
-      ],
-      "windows": {
-        "installMode": "passive"
-      }
-    }
-  },
   "bundle": {
     "active": true,
     "icon": [
@@ -47,7 +37,7 @@
       "app",
       "nsis"
     ],
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "windows": {
       "nsis": {
         "installMode": "currentUser",
