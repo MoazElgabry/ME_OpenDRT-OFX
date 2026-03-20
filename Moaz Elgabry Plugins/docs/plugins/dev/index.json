@@ -1,0 +1,15 @@
+{
+  "generatedAt": "2026-03-17T00:00:00Z",
+  "plugins": [
+    {
+      "pluginId": "chromaspace",
+      "displayName": "Chromaspace",
+      "manifestUrl": "${MEPM_MANAGER_ROOT}\\docs\\plugins\\dev\\chromaspace.local.json"
+    },
+    {
+      "pluginId": "me-opendrt",
+      "displayName": "ME_OpenDRT",
+      "manifestUrl": "${MEPM_MANAGER_ROOT}\\docs\\plugins\\dev\\me-opendrt.local.json"
+    }
+  ]
+}

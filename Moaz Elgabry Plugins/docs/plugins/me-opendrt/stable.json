@@ -1,0 +1,51 @@
+{
+  "pluginId": "me-opendrt",
+  "displayName": "ME_OpenDRT",
+  "version": "0.0.0-dev",
+  "releaseDate": "2026-03-17T00:00:00Z",
+  "releaseNotesUrl": "https://moazelgabry.github.io/MoazElgabryPluginManager/release-notes/me-opendrt-0.0.0-dev.html",
+  "platforms": [
+    {
+      "platform": "macos",
+      "arch": "universal",
+      "downloadUrl": "https://github.com/MoazElgabry/ME_OFX/releases/download/me-opendrt-v0.0.0-dev/ME_OpenDRT-macos-universal.zip",
+      "sha256": "REPLACE_WITH_REAL_SHA256",
+      "packageType": "zip",
+      "bundleName": "ME_OpenDRT.ofx.bundle",
+      "bundleIdentifier": "com.moazelgabry.me-opendrt",
+      "installPath": "/Library/OFX/Plugins",
+      "minManagerVersion": "0.1.0",
+      "hostProcesses": [
+        "Resolve",
+        "DaVinci Resolve",
+        "Fusion",
+        "Fusion Studio",
+        "Nuke",
+        "NukeX",
+        "NukeStudio",
+        "Hiero"
+      ]
+    },
+    {
+      "platform": "windows",
+      "arch": "x86_64",
+      "downloadUrl": "https://github.com/MoazElgabry/ME_OFX/releases/download/me-opendrt-v0.0.0-dev/ME_OpenDRT-windows-x86_64.zip",
+      "sha256": "REPLACE_WITH_REAL_SHA256",
+      "packageType": "zip",
+      "bundleName": "ME_OpenDRT.ofx.bundle",
+      "bundleIdentifier": "com.moazelgabry.me-opendrt",
+      "installPath": "C:\\Program Files\\Common Files\\OFX\\Plugins",
+      "minManagerVersion": "0.1.0",
+      "hostProcesses": [
+        "Resolve",
+        "DaVinci Resolve",
+        "Fusion",
+        "Fusion Studio",
+        "Nuke",
+        "NukeX",
+        "NukeStudio",
+        "Hiero"
+      ]
+    }
+  ]
+}

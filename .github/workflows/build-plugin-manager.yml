@@ -1,10 +1,10 @@
-name: Build MoazElgabry Plugin Manager
+name: Build Moaz Elgabry Plugins
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - "MoazElgabryPluginManager/**"
+      - "Moaz Elgabry Plugins/**"
       - ".github/workflows/build-plugin-manager.yml"
 
 jobs:
@@ -29,10 +29,10 @@ jobs:
         with:
           node-version: lts/*
           cache: npm
-          cache-dependency-path: MoazElgabryPluginManager/package.json
+          cache-dependency-path: "Moaz Elgabry Plugins/package.json"
 
       - name: Install frontend dependencies
-        working-directory: MoazElgabryPluginManager
+        working-directory: "Moaz Elgabry Plugins"
         run: npm install
 
       - name: Install Rust stable
@@ -41,7 +41,7 @@ jobs:
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: MoazElgabryPluginManager/src-tauri -> target
+          workspaces: "Moaz Elgabry Plugins/src-tauri -> target"
 
       - name: Build and draft release
         uses: tauri-apps/tauri-action@v1
@@ -52,9 +52,9 @@ jobs:
           MEPM_UPDATER_PUBKEY: ${{ secrets.MEPM_UPDATER_PUBKEY }}
           MEPM_UPDATER_ENDPOINT: https://moazelgabry.github.io/MoazElgabryPluginManager/updates/latest.json
         with:
-          projectPath: MoazElgabryPluginManager
+          projectPath: "Moaz Elgabry Plugins"
           tagName: plugin-manager-v__VERSION__
-          releaseName: MoazElgabry Plugin Manager v__VERSION__
+          releaseName: Moaz Elgabry Plugins v__VERSION__
           releaseBody: See the release assets for installer and updater artifacts.
           releaseDraft: true
           prerelease: false

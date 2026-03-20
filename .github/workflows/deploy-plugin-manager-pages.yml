@@ -6,7 +6,7 @@ on:
     branches:
       - main
     paths:
-      - "MoazElgabryPluginManager/docs/**"
+      - "Moaz Elgabry Plugins/docs/**"
       - ".github/workflows/deploy-plugin-manager-pages.yml"
 
 permissions:
@@ -30,7 +30,7 @@ jobs:
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: MoazElgabryPluginManager/docs
+          path: "Moaz Elgabry Plugins/docs"
 
   deploy:
     needs: build

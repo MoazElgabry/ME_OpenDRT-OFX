@@ -1,0 +1,19 @@
+{
+  "version": "0.1.0",
+  "notes": "Initial metadata placeholder. Replace URLs and signatures after the first signed manager release.",
+  "pub_date": "2026-03-17T00:00:00Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "REPLACE_WITH_WINDOWS_SIGNATURE",
+      "url": "https://github.com/MoazElgabry/MoazElgabryPluginManager/releases/download/plugin-manager-v0.1.0/MoazElgabryPluginManager_0.1.0_x64-setup.nsis.zip"
+    },
+    "darwin-x86_64": {
+      "signature": "REPLACE_WITH_MAC_INTEL_SIGNATURE",
+      "url": "https://github.com/MoazElgabry/MoazElgabryPluginManager/releases/download/plugin-manager-v0.1.0/MoazElgabryPluginManager.app.tar.gz"
+    },
+    "darwin-aarch64": {
+      "signature": "REPLACE_WITH_MAC_ARM_SIGNATURE",
+      "url": "https://github.com/MoazElgabry/MoazElgabryPluginManager/releases/download/plugin-manager-v0.1.0/MoazElgabryPluginManager-aarch64.app.tar.gz"
+    }
+  }
+}

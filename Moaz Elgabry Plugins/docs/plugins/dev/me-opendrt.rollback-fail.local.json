@@ -1,0 +1,51 @@
+{
+  "pluginId": "me-opendrt",
+  "displayName": "ME_OpenDRT",
+  "version": "1.2.11-rollback-test",
+  "releaseDate": "2026-03-17T00:00:00Z",
+  "releaseNotesUrl": "https://moazelgabry.github.io/MoazElgabryPluginManager/release-notes/me-opendrt-1.2.11-rollback-test.html",
+  "platforms": [
+    {
+      "platform": "windows",
+      "arch": "x86_64",
+      "downloadUrl": "mepm-test-fail-after-backup::${ME_OFX_ROOT}\\ME_OpenDRT\\source\\bundle\\ME_OpenDRT.ofx.bundle",
+      "sha256": "DEV_SKIP",
+      "packageType": "bundle-dir",
+      "bundleName": "ME_OpenDRT.ofx.bundle",
+      "bundleIdentifier": "com.moazelgabry.me-opendrt",
+      "installPath": "C:\\Program Files\\Common Files\\OFX\\Plugins",
+      "minManagerVersion": "0.1.0",
+      "hostProcesses": [
+        "Resolve",
+        "DaVinci Resolve",
+        "Fusion",
+        "Fusion Studio",
+        "Nuke",
+        "NukeX",
+        "NukeStudio",
+        "Hiero"
+      ]
+    },
+    {
+      "platform": "macos",
+      "arch": "universal",
+      "downloadUrl": "mepm-test-fail-after-backup::${ME_OFX_ROOT}/ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle",
+      "sha256": "DEV_SKIP",
+      "packageType": "bundle-dir",
+      "bundleName": "ME_OpenDRT.ofx.bundle",
+      "bundleIdentifier": "com.moazelgabry.me-opendrt",
+      "installPath": "/Library/OFX/Plugins",
+      "minManagerVersion": "0.1.0",
+      "hostProcesses": [
+        "Resolve",
+        "DaVinci Resolve",
+        "Fusion",
+        "Fusion Studio",
+        "Nuke",
+        "NukeX",
+        "NukeStudio",
+        "Hiero"
+      ]
+    }
+  ]
+}

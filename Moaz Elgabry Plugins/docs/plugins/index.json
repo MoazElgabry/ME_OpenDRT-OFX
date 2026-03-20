@@ -1,0 +1,15 @@
+{
+  "generatedAt": "2026-03-17T00:00:00Z",
+  "plugins": [
+    {
+      "pluginId": "chromaspace",
+      "displayName": "Chromaspace",
+      "manifestUrl": "https://moazelgabry.github.io/MoazElgabryPluginManager/plugins/chromaspace/stable.json"
+    },
+    {
+      "pluginId": "me-opendrt",
+      "displayName": "ME_OpenDRT",
+      "manifestUrl": "https://moazelgabry.github.io/MoazElgabryPluginManager/plugins/me-opendrt/stable.json"
+    }
+  ]
+}

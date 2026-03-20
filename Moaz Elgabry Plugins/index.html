@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Moaz Elgabry Plugins</title>
+    <script type="module" src="/src/main.js"></script>
+  </head>
+  <body>
+    <div id="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">ME</div>
+          <div>
+            <h1>Moaz Elgabry Plugins</h1>
+          </div>
+        </div>
+
+        <section class="panel compact">
+          <div class="panel-header">
+            <h2>Manager</h2>
+          </div>
+          <dl class="summary-grid">
+            <div>
+              <dt>Version</dt>
+              <dd id="manager-version">-</dd>
+            </div>
+            <div>
+              <dt>Platform</dt>
+              <dd id="manager-platform">-</dd>
+            </div>
+            <div>
+              <dt>Catalog</dt>
+              <dd id="catalog-source">-</dd>
+            </div>
+            <div>
+              <dt>Updater</dt>
+              <dd id="updater-status">-</dd>
+            </div>
+          </dl>
+          <div class="button-row">
+            <button id="refresh-button" class="primary">Refresh Plugin Catalog</button>
+            <button id="check-updates-button">Check for Manager Updates</button>
+          </div>
+        </section>
+
+        <section class="panel compact">
+          <div class="panel-header">
+            <h2>Activity</h2>
+          </div>
+          <div id="activity-log" class="activity-log" aria-live="polite"></div>
+        </section>
+      </aside>
+
+      <main class="content">
+        <section id="alert-banner" class="alert-banner hidden" aria-live="assertive">
+          <div>
+            <p class="eyebrow alert-label">Attention</p>
+            <p id="alert-summary"></p>
+            <details id="alert-details" class="alert-details hidden">
+              <summary>Technical details</summary>
+              <pre id="alert-message"></pre>
+            </details>
+          </div>
+          <button id="alert-dismiss" class="ghost-button" type="button">Dismiss</button>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Plugins</h2>
+              <p class="subtle">System-wide OFX install targets only in v1.</p>
+            </div>
+          </div>
+
+          <div id="plugin-list" class="plugin-list">
+            <div class="empty-state">Loading plugin status...</div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>
