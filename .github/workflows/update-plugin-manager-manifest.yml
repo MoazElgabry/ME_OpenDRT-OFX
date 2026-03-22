@@ -1,0 +1,51 @@
+name: Update Plugin Manager Manifest
+
+on:
+  workflow_dispatch:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  update-manager-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout plugin repo
+        uses: actions/checkout@v5
+
+      - name: Checkout manager repo
+        uses: actions/checkout@v5
+        with:
+          repository: MoazElgabry/Moaz-Elgabry-plugins
+          path: manager-repo
+          token: ${{ secrets.MEPM_MANAGER_REPO_TOKEN }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+
+      - name: Regenerate manager manifests
+        run: |
+          node manager-repo/tools/generate-plugin-channel-manifests.mjs \
+            --manager-root manager-repo \
+            --config manager-release-config.json
+
+      - name: Create manager manifest PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.MEPM_MANAGER_REPO_TOKEN }}
+          path: manager-repo
+          commit-message: "Update plugin manifests for ME_OpenDRT"
+          branch: "automation/me-opendrt-manifests-${{ github.run_id }}"
+          delete-branch: true
+          title: "Update plugin manifests for ME_OpenDRT"
+          body: |
+            Regenerated manager manifests from `manager-release-config.json`
+            in the `MoazElgabry/ME_OpenDRT-OFX` release repo.
+
+            Trigger: `${{ github.event_name }}`
+            Release: `${{ github.event.release.tag_name || 'manual-run' }}`
