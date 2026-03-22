@@ -28,11 +28,18 @@ jobs:
         with:
           node-version: lts/*
 
+      - name: Download published release metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > plugin-releases.json
+
       - name: Regenerate manager manifests
         run: |
           node manager-repo/tools/generate-plugin-channel-manifests.mjs \
             --manager-root manager-repo \
-            --config manager-release-config.json
+            --config manager-release-config.json \
+            --releases-json plugin-releases.json
 
       - name: Create manager manifest PR
         uses: peter-evans/create-pull-request@v7
@@ -44,8 +51,8 @@ jobs:
           delete-branch: true
           title: "Update plugin manifests for ME_OpenDRT"
           body: |
-            Regenerated manager manifests from `manager-release-config.json`
-            in the `MoazElgabry/ME_OpenDRT-OFX` release repo.
+            Regenerated manager manifests from published releases in
+            `MoazElgabry/ME_OpenDRT-OFX`.
 
             Trigger: `${{ github.event_name }}`
             Release: `${{ github.event.release.tag_name || 'manual-run' }}`
