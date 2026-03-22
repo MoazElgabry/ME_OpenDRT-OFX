@@ -8,10 +8,6 @@ on:
 
 jobs:
   build-linux:
-    env:
-      OPENDRT_VERSION: v1.2.11
-      ARTIFACT_NAME: ME_OpenDRT-v1.2.11-linux-x86_64-cuda-opencl-cpu
-      ARCHIVE_NAME: ME_OpenDRT_v1.2.11_linux_x86_64_cuda_opencl_cpu_portable.tar.gz
     runs-on: ubuntu-22.04
 
     defaults:
@@ -22,6 +18,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Resolve package version
+        id: version
+        run: |
+          version="$(grep -Eo 'set\(OPENDRT_DISPLAY_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          if [ -z "${version}" ]; then
+            version="$(grep -Eo 'project\(ME_OpenDRT VERSION [0-9A-Za-z.\-]+' CMakeLists.txt | sed -E 's/.*VERSION ([0-9A-Za-z.\-]+)/\1/' | head -n1)"
+          fi
+          if [ -z "${version}" ]; then
+            echo "Could not determine ME_OpenDRT version from ME_OpenDRT/source/CMakeLists.txt"
+            exit 1
+          fi
+          echo "package_version=${version}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=ME_OpenDRT-v${version}-linux-x86_64-cuda-opencl-cpu" >> "$GITHUB_OUTPUT"
+          echo "archive_name=ME_OpenDRT_v${version}_linux_x86_64_cuda_opencl_cpu_portable.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Install dependencies
         run: |
@@ -66,14 +77,14 @@ jobs:
 
       - name: Package Linux portable bundle
         run: |
-          tar -czf ../../${ARCHIVE_NAME} \
+          tar -czf ../../${{ steps.version.outputs.archive_name }} \
             -C bundle ME_OpenDRT.ofx.bundle
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.ARCHIVE_NAME }}
+          name: ${{ steps.version.outputs.artifact_name }}
+          path: ${{ steps.version.outputs.archive_name }}
 
 
 

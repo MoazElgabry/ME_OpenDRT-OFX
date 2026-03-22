@@ -1,201 +1,269 @@
-name: Build ME_OpenDRT All Platforms (macOS + Linux + Windows)
+name: Build ME_OpenDRT All Platforms
 
 on:
   workflow_dispatch:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
 
-env:
-  OPENDRT_VERSION: v1.2.11
+permissions:
+  contents: write
 
 jobs:
-  build-macos:
-    env:
-      ZIP_NAME: ME_OpenDRT_v1.2.11_macOS_universal_portable.zip
-      ARTIFACT_NAME: ME_OpenDRT-v1.2.11-macos-universal
-
-    runs-on: macos-14
-
-    defaults:
-      run:
-        shell: bash
-        working-directory: ME_OpenDRT/source
-
+  detect-changes:
+    name: Detect build-relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.changes.outputs.should_build }}
+      changed_files: ${{ steps.changes.outputs.changed_files }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
 
-      - name: Ensure build tools are available
+      - name: Decide whether ME_OpenDRT should build
+        id: changes
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
         run: |
-          if command -v ninja >/dev/null 2>&1; then
-            echo "ninja already available: $(command -v ninja)"
-            ninja --version
+          set -euo pipefail
+
+          if [ -z "${BEFORE}" ] || [ "${BEFORE}" = "0000000000000000000000000000000000000000" ]; then
+            changed_files="$(git ls-files)"
           else
-            brew install ninja
+            changed_files="$(git diff --name-only "${BEFORE}" "${AFTER}")"
           fi
 
-      - name: Configure
-        run: cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DME_OPENDRT_BUILD_CUBE_VIEWER_STUB=ON -DME_OPENDRT_VIEWER_FORCE_BUNDLED_GLFW=ON
+          printf '%s\n' "${changed_files}" > changed_files.txt
 
-      - name: Build
-        run: cmake --build build-mac --config Release
+          if grep -Eq '^(ME_OpenDRT/source/CMakeLists\.txt|ME_OpenDRT/source/cmake/|ME_OpenDRT/source/src/|ME_OpenDRT/source/tools/|ME_OpenDRT/OFX-Workshop/|\.github/workflows/build-me_opendrt-(all-platforms|linux|macos|macos-arm64-safe|windows)\.yml)' changed_files.txt; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Verify bundle outputs
+          {
+            echo "changed_files<<EOF"
+            cat changed_files.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Summarize decision
         run: |
-          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx
-          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT_CubeViewer
-          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib
-          lipo -archs bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx | grep -q "x86_64 arm64"
-          lipo -archs bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT_CubeViewer | grep -q "x86_64 arm64"
-          otool -l bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
-          otool -l bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT_CubeViewer | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
-          strings bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib | grep -E -q "air64-apple-macosx13(\\.|$)"
-          xcrun metal-objdump -t bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib | grep -q "OpenDRTKernel"
+          if [ "${{ steps.changes.outputs.should_build }}" = "true" ]; then
+            {
+              echo "ME_OpenDRT build will run."
+              echo
+              echo "Relevant changes were detected in:"
+              printf '%s\n' "${{ steps.changes.outputs.changed_files }}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "ME_OpenDRT build skipped cleanly."
+              echo
+              echo "No build-relevant changes were detected."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
-      - name: Package macOS portable bundle
-        run: |
-          ditto -c -k --sequesterRsrc --keepParent \
-            bundle/ME_OpenDRT.ofx.bundle \
-            ../../${ZIP_NAME}
+  windows:
+    needs: detect-changes
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.should_build == 'true'
+    uses: ./.github/workflows/build-me_opendrt-windows.yml
+    secrets: inherit
 
-      - name: Upload macOS artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.ZIP_NAME }}
+  macos:
+    needs: detect-changes
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.should_build == 'true'
+    uses: ./.github/workflows/build-me_opendrt-macos.yml
+    secrets: inherit
 
-  build-linux:
-    env:
-      ARTIFACT_NAME: ME_OpenDRT-v1.2.11-linux-x86_64-cuda-opencl-cpu
-      ARCHIVE_NAME: ME_OpenDRT_v1.2.11_linux_x86_64_cuda_opencl_cpu_portable.tar.gz
+  linux:
+    needs: detect-changes
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.should_build == 'true'
+    uses: ./.github/workflows/build-me_opendrt-linux.yml
+    secrets: inherit
 
-    runs-on: ubuntu-22.04
-
-    defaults:
-      run:
-        shell: bash
-        working-directory: ME_OpenDRT/source
+  draft-release:
+    name: Create ME_OpenDRT Draft Release
+    needs:
+      - detect-changes
+      - windows
+      - macos
+      - linux
+    if: github.event_name == 'push' && needs.detect-changes.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++ ocl-icd-opencl-dev libglfw3-dev libgl1-mesa-dev xvfb
-          sudo apt-get install -y nvidia-cuda-toolkit
-
-      - name: Configure
-        run: |
-          cmake -S . -B build-linux -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DME_OPENDRT_LINUX_CUDA=ON \
-            -DME_OPENDRT_BUILD_CUBE_VIEWER_STUB=ON -DME_OPENDRT_VIEWER_FORCE_BUNDLED_GLFW=ON
-
-      - name: Build
-        run: cmake --build build-linux --config Release -j
-
-      - name: Verify bundle outputs
-        run: |
-          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Linux-x86-64/ME_OpenDRT.ofx
-          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Linux-x86-64/ME_OpenDRT_CubeViewer
-          chmod +x bundle/ME_OpenDRT.ofx.bundle/Contents/Linux-x86-64/ME_OpenDRT_CubeViewer
-
-      - name: Verify Linux viewer runtime deps and launch
-        run: |
-          viewer="bundle/ME_OpenDRT.ofx.bundle/Contents/Linux-x86-64/ME_OpenDRT_CubeViewer"
-          ldd "$viewer" | tee /tmp/me_opendrt_viewer_ldd.txt
-          if grep -q "not found" /tmp/me_opendrt_viewer_ldd.txt; then
-            echo "Unresolved shared libraries in Cube Viewer"
-            exit 1
-          fi
-          set +e
-          timeout 5s xvfb-run -a "$viewer" >/tmp/me_opendrt_viewer_run.log 2>&1
-          rc=$?
-          set -e
-          if [ "$rc" -ne 124 ]; then
-            echo "Cube Viewer exited early (rc=$rc); expected timeout(124) if launch is healthy."
-            cat /tmp/me_opendrt_viewer_run.log
-            exit 1
-          fi
-
-      - name: Upload Linux artifact
-        uses: actions/upload-artifact@v6
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v5
         with:
-          name: ${{ env.ARTIFACT_NAME }}-bundle
-          path: ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
+          path: artifacts
 
-  build-windows:
-    runs-on: windows-2022
-
-    defaults:
-      run:
-        shell: powershell
+      - name: Resolve package version
+        id: version
         working-directory: ME_OpenDRT/source
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Setup MSVC dev command prompt
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Detect preinstalled CUDA
-        id: detect_cuda
         run: |
-          $nvcc = Get-Command nvcc -ErrorAction SilentlyContinue
-          if ($null -ne $nvcc) {
-            "has_cuda=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            Write-Host "Found preinstalled nvcc at $($nvcc.Source)"
-            & nvcc --version
-          } else {
-            "has_cuda=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            Write-Host "No preinstalled nvcc found; CUDA toolkit install will run."
-          }
+          set -euo pipefail
 
-      - name: Setup CUDA Toolkit
-        if: steps.detect_cuda.outputs.has_cuda != 'true'
-        uses: Jimver/cuda-toolkit@v0.2.29
-        with:
-          cuda: "12.5.0"
-          method: "network"
+          version="$(grep -Eo 'set\(OPENDRT_DISPLAY_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          if [ -z "${version}" ]; then
+            version="$(grep -Eo 'project\(ME_OpenDRT VERSION [0-9A-Za-z.\-]+' CMakeLists.txt | sed -E 's/.*VERSION ([0-9A-Za-z.\-]+)/\1/' | head -n1)"
+          fi
+          if [ -z "${version}" ]; then
+            echo "Could not determine ME_OpenDRT version from ME_OpenDRT/source/CMakeLists.txt"
+            exit 1
+          fi
+          echo "package_version=${version}" >> "$GITHUB_OUTPUT"
 
-      - name: Detect preinstalled Ninja
-        id: detect_ninja
+      - name: Prepare draft release metadata
+        id: draft_meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.package_version }}
         run: |
-          $ninja = Get-Command ninja -ErrorAction SilentlyContinue
-          if ($null -ne $ninja) {
-            "has_ninja=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            Write-Host "Found preinstalled ninja at $($ninja.Source)"
-            & ninja --version
-          } else {
-            "has_ninja=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            Write-Host "No preinstalled ninja found; install will run."
-          }
+          set -euo pipefail
 
-      - name: Install Ninja
-        if: steps.detect_ninja.outputs.has_ninja != 'true'
-        run: choco install ninja --no-progress -y
+          latest_json="$(gh api "repos/${REPO}/releases/latest" 2>/dev/null || true)"
+          if [ -n "${latest_json}" ]; then
+            latest_tag="$(printf '%s' "${latest_json}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('tag_name',''))")"
+            latest_name="$(printf '%s' "${latest_json}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('name',''))")"
+            printf '%s' "${latest_json}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('body',''))" > latest_release_body.txt
+          else
+            latest_tag="unreleased"
+            latest_name="ME_OpenDRT"
+            : > latest_release_body.txt
+          fi
 
-      - name: Configure
-        run: cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DME_OPENDRT_BUILD_CUBE_VIEWER_STUB=ON -DME_OPENDRT_VIEWER_FORCE_BUNDLED_GLFW=ON
+          short_sha="${SHA::7}"
+          draft_tag="me-opendrt-draft-v${PACKAGE_VERSION}"
+          draft_title="${latest_name} draft (${REF_NAME} ${short_sha})"
+          final_tag="v${PACKAGE_VERSION}"
 
-      - name: Build
-        run: cmake --build build-win --config Release
+          existing_draft_json="$(gh api "repos/${REPO}/releases/tags/${draft_tag}" 2>/dev/null || true)"
+          final_release_json="$(gh api "repos/${REPO}/releases/tags/${final_tag}" 2>/dev/null || true)"
 
-      - name: Verify bundle outputs
+          draft_exists="false"
+          skip_release="false"
+
+          if [ -n "${existing_draft_json}" ]; then
+            is_draft="$(printf '%s' "${existing_draft_json}" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('draft', False)).lower())")"
+            if [ "${is_draft}" = "true" ]; then
+              draft_exists="true"
+            else
+              echo "Release tag ${draft_tag} already exists and is not a draft."
+              exit 1
+            fi
+          fi
+
+          if [ -n "${final_release_json}" ]; then
+            final_is_draft="$(printf '%s' "${final_release_json}" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('draft', False)).lower())")"
+            if [ "${final_is_draft}" != "true" ]; then
+              skip_release="true"
+            fi
+          fi
+
+          {
+            echo "DRAFT_TAG=${draft_tag}"
+            echo "DRAFT_TITLE=${draft_title}"
+            echo "LATEST_TAG=${latest_tag}"
+            echo "LATEST_NAME=${latest_name}"
+            echo "FINAL_TAG=${final_tag}"
+            echo "DRAFT_EXISTS=${draft_exists}"
+            echo "SKIP_RELEASE=${skip_release}"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "draft_exists=${draft_exists}"
+            echo "skip_release=${skip_release}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build draft release notes
+        if: steps.draft_meta.outputs.skip_release != 'true'
+        env:
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          REF_NAME: ${{ github.ref_name }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.package_version }}
         run: |
-          if (!(Test-Path "bundle/ME_OpenDRT.ofx.bundle/Contents/Win64/ME_OpenDRT.ofx")) {
-            throw "Missing Windows plugin binary"
-          }
-          if (!(Test-Path "bundle/ME_OpenDRT.ofx.bundle/Contents/Win64/ME_OpenDRT_CubeViewer.exe")) {
-            throw "Missing Windows cube viewer binary"
-          }
+          set -euo pipefail
 
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: ME_OpenDRT-v1.2.11-windows-x86_64-bundle
-          path: ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
+          short_sha="${SHA::7}"
+          {
+            echo "Automated draft release for ME_OpenDRT."
+            echo
+            echo "- Version: ${PACKAGE_VERSION}"
+            echo "- Base release: ${LATEST_NAME} (${LATEST_TAG})"
+            echo "- Branch: ${REF_NAME}"
+            echo "- Commit: ${short_sha}"
+            echo "- Triggered by: ${ACTOR}"
+            echo "- Workflow run: ${SERVER_URL}/${REPO}/actions/runs/${{ github.run_id }}"
+            echo
+            if [ -s latest_release_body.txt ]; then
+              echo "## Base Release Notes"
+              echo
+              cat latest_release_body.txt
+              echo
+            fi
+            echo "## Included Artifacts"
+            if [ -d artifacts ]; then
+              find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec basename {} \; | sed 's/^/- /' | sort
+            else
+              echo "- No downloaded artifacts were found for this run."
+            fi
+          } > draft_release_notes.md
+
+      - name: Skip draft release because version is already published
+        if: steps.draft_meta.outputs.skip_release == 'true'
+        run: |
+          {
+            echo "ME_OpenDRT draft release skipped cleanly."
+            echo
+            echo "A published release already exists for ${FINAL_TAG}."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create or update draft release
+        if: steps.draft_meta.outputs.skip_release != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t release_files < <(find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) | sort)
+          if [ "${#release_files[@]}" -eq 0 ]; then
+            echo "No packaged ME_OpenDRT artifacts were found."
+            exit 1
+          fi
+
+          if [ "${DRAFT_EXISTS}" = "true" ]; then
+            gh release edit "${DRAFT_TAG}" \
+              --title "${DRAFT_TITLE}" \
+              --notes-file draft_release_notes.md
+            gh release upload "${DRAFT_TAG}" \
+              --clobber \
+              "${release_files[@]}"
+            {
+              echo "ME_OpenDRT draft release updated."
+              echo
+              echo "- Draft tag: ${DRAFT_TAG}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            gh release create "${DRAFT_TAG}" \
+              --draft \
+              --title "${DRAFT_TITLE}" \
+              --notes-file draft_release_notes.md \
+              "${release_files[@]}"
+            {
+              echo "ME_OpenDRT draft release created."
+              echo
+              echo "- Draft tag: ${DRAFT_TAG}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

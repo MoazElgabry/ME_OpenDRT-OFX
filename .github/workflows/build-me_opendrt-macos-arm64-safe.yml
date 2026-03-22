@@ -6,9 +6,6 @@ on:
     tags:
       - "v*"
 
-env:
-  OPENDRT_VERSION: v1.2.11
-
 jobs:
   build-macos-arm64-safe:
     runs-on: macos-14
@@ -21,6 +18,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Resolve package version
+        id: version
+        run: |
+          version="$(grep -Eo 'set\(OPENDRT_DISPLAY_VERSION "[^"]+"\)' CMakeLists.txt | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+          if [ -z "${version}" ]; then
+            version="$(grep -Eo 'project\(ME_OpenDRT VERSION [0-9A-Za-z.\-]+' CMakeLists.txt | sed -E 's/.*VERSION ([0-9A-Za-z.\-]+)/\1/' | head -n1)"
+          fi
+          if [ -z "${version}" ]; then
+            echo "Could not determine ME_OpenDRT version from ME_OpenDRT/source/CMakeLists.txt"
+            exit 1
+          fi
+          echo "package_version=${version}" >> "$GITHUB_OUTPUT"
+          echo "zip_name=ME_OpenDRT_v${version}_macOS_arm64_safe_math_portable.zip" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=ME_OpenDRT-v${version}-macos-arm64-safe-math" >> "$GITHUB_OUTPUT"
 
       - name: Report macOS toolchain
         run: |
@@ -71,10 +83,10 @@ jobs:
         run: |
           ditto -c -k --sequesterRsrc --keepParent \
             bundle/ME_OpenDRT.ofx.bundle \
-            ../../ME_OpenDRT_v1.2.11_macOS_arm64_safe_math_portable.zip
+            ../../${{ steps.version.outputs.zip_name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: ME_OpenDRT-v1.2.11-macos-arm64-safe-math
-          path: ME_OpenDRT_v1.2.11_macOS_arm64_safe_math_portable.zip
+          name: ${{ steps.version.outputs.artifact_name }}
+          path: ${{ steps.version.outputs.zip_name }}

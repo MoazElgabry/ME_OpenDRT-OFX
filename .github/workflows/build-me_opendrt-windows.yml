@@ -8,11 +8,6 @@ on:
 
 jobs:
   build-windows:
-    env:
-      OPENDRT_VERSION: v1.2.11
-      ZIP_NAME: ME_OpenDRT_v1.2.11_windows_x86_64_portable.zip
-      ARTIFACT_NAME: ME_OpenDRT-v1.2.11-windows-x86_64
-
     runs-on: windows-2022
 
     defaults:
@@ -23,6 +18,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Resolve package version
+        id: version
+        run: |
+          $cmake = Get-Content "CMakeLists.txt" -Raw
+          if ($cmake -match 'set\(OPENDRT_DISPLAY_VERSION\s+"([^"]+)"\)') {
+            $version = $Matches[1]
+          } elseif ($cmake -match 'project\(ME_OpenDRT VERSION\s+([0-9A-Za-z\.\-]+)') {
+            $version = $Matches[1]
+          } else {
+            throw "Could not determine ME_OpenDRT version from ME_OpenDRT/source/CMakeLists.txt"
+          }
+          "package_version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "zip_name=ME_OpenDRT_v${version}_windows_x86_64_portable.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "artifact_name=ME_OpenDRT-v${version}-windows-x86_64" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Setup MSVC dev command prompt
         uses: ilammy/msvc-dev-cmd@v1
@@ -81,14 +91,15 @@ jobs:
 
       - name: Package Windows portable bundle
         run: |
-          if (Test-Path "..\..\$env:ZIP_NAME") { Remove-Item "..\..\$env:ZIP_NAME" -Force }
-          Compress-Archive -Path "bundle/ME_OpenDRT.ofx.bundle" -DestinationPath "..\..\$env:ZIP_NAME" -CompressionLevel Optimal
+          $zipName = "${{ steps.version.outputs.zip_name }}"
+          if (Test-Path "..\\..\\$zipName") { Remove-Item "..\\..\\$zipName" -Force }
+          Compress-Archive -Path "bundle/ME_OpenDRT.ofx.bundle" -DestinationPath "..\\..\\$zipName" -CompressionLevel Optimal
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ${{ env.ZIP_NAME }}
+          name: ${{ steps.version.outputs.artifact_name }}
+          path: ${{ steps.version.outputs.zip_name }}
 
 
 
