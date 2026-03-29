@@ -65,7 +65,7 @@
       "family": "linux",
       "platform": "linux",
       "arch": "x86_64",
-      "assetPattern": "^ME_OpenDRT_.*linux.*portable\\.tar\\.gz$",
+      "assetPattern": "^ME_OpenDRT_.*linux_x86_64_cuda_opencl.*portable\\.tar\\.gz$",
       "packageType": "tar.gz",
       "bundleName": "ME_OpenDRT.ofx.bundle",
       "bundleIdentifier": "com.moazelgabry.me-opendrt",

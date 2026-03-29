@@ -198,6 +198,32 @@ jobs:
           set -euo pipefail
 
           short_sha="${SHA::7}"
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          source = Path("latest_release_body.txt")
+          target = Path("latest_release_body_sanitized.txt")
+
+          if not source.exists():
+              target.write_text("", encoding="utf-8")
+              raise SystemExit(0)
+
+          text = source.read_text(encoding="utf-8")
+          text = re.sub(
+              r"<!--\s*manager-highlights:start\s*-->.*?<!--\s*manager-highlights:end\s*-->",
+              "",
+              text,
+              flags=re.DOTALL | re.IGNORECASE,
+          )
+          text = re.sub(
+              r"(?im)^\s*manager-available-stable\s*:\s*true\s*$",
+              "",
+              text,
+          )
+          text = text.strip()
+          target.write_text(f"{text}\n" if text else "", encoding="utf-8")
+          PY
           {
             echo "Automated draft release for ME_OpenDRT."
             echo
@@ -208,12 +234,19 @@ jobs:
             echo "- Triggered by: ${ACTOR}"
             echo "- Workflow run: ${SERVER_URL}/${REPO}/actions/runs/${{ github.run_id }}"
             echo
-            if [ -s latest_release_body.txt ]; then
+            if [ -s latest_release_body_sanitized.txt ]; then
               echo "## Base Release Notes"
               echo
-              cat latest_release_body.txt
+              cat latest_release_body_sanitized.txt
               echo
             fi
+            echo "## Manager Highlights"
+            echo
+            echo "Add short user-facing highlights between the markers before publishing."
+            echo
+            echo "<!-- manager-highlights:start -->"
+            echo "<!-- manager-highlights:end -->"
+            echo
             echo "## Included Artifacts"
             if [ -d artifacts ]; then
               find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec basename {} \; | sed 's/^/- /' | sort
