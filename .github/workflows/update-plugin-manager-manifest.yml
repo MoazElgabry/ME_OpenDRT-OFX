@@ -43,12 +43,13 @@ jobs:
             --releases-json plugin-releases.json
 
       - name: Create manager manifest PR
+        id: create_pr
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.MEPM_MANAGER_REPO_TOKEN }}
           path: manager-repo
           commit-message: "Update plugin manifests for ME_OpenDRT"
-          branch: "automation/me-opendrt-manifests-${{ github.run_id }}"
+          branch: "automation/me-opendrt-manifests"
           delete-branch: true
           title: "Update plugin manifests for ME_OpenDRT"
           body: |
@@ -57,3 +58,14 @@ jobs:
 
             Trigger: `${{ github.event_name }}`
             Release: `${{ github.event.release.tag_name || 'manual-run' }}`
+
+      - name: Enable manager manifest PR auto-merge
+        if: ${{ steps.create_pr.outputs.pull-request-number != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.MEPM_MANAGER_REPO_TOKEN }}
+        run: |
+          gh pr merge "${{ steps.create_pr.outputs.pull-request-number }}" \
+            --repo MoazElgabry/Moaz-Elgabry-plugins \
+            --auto \
+            --squash \
+            --delete-branch
