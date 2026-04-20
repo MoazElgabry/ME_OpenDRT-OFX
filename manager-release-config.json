@@ -2,6 +2,7 @@
   "pluginId": "me-opendrt",
   "displayName": "ME_OpenDRT",
   "releaseRepo": "MoazElgabry/ME_OpenDRT-OFX",
+  "iconSourcePath": "icons/plugin-manager.png",
   "minManagerVersion": "0.1.0",
   "hostProcesses": [
     "Resolve",
