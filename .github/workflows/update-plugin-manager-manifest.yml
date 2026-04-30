@@ -7,6 +7,10 @@ on:
       - published
       - edited
 
+concurrency:
+  group: update-plugin-manager-manifest-${{ github.event.release.id || github.ref || github.run_id }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -59,13 +63,25 @@ jobs:
             Trigger: `${{ github.event_name }}`
             Release: `${{ github.event.release.tag_name || 'manual-run' }}`
 
-      - name: Enable manager manifest PR auto-merge
+      - name: Merge or enable auto-merge for manager manifest PR
         if: ${{ steps.create_pr.outputs.pull-request-number != '' }}
         env:
           GH_TOKEN: ${{ secrets.MEPM_MANAGER_REPO_TOKEN }}
         run: |
-          gh pr merge "${{ steps.create_pr.outputs.pull-request-number }}" \
-            --repo MoazElgabry/Moaz-Elgabry-plugins \
-            --auto \
-            --squash \
-            --delete-branch
+          set -euo pipefail
+          pr_number="${{ steps.create_pr.outputs.pull-request-number }}"
+          repo="MoazElgabry/Moaz-Elgabry-plugins"
+          merge_state="$(gh pr view "${pr_number}" --repo "${repo}" --json mergeStateStatus --jq .mergeStateStatus)"
+
+          if [ "${merge_state}" = "CLEAN" ] || [ "${merge_state}" = "HAS_HOOKS" ]; then
+            gh pr merge "${pr_number}" \
+              --repo "${repo}" \
+              --squash \
+              --delete-branch
+          else
+            gh pr merge "${pr_number}" \
+              --repo "${repo}" \
+              --auto \
+              --squash \
+              --delete-branch
+          fi
