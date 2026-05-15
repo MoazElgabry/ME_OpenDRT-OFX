@@ -1,6 +1,7 @@
 name: Build ME_OpenDRT Linux (single x86_64 CUDA build with OpenCL/CPU fallback)
 
 on:
+  workflow_call:
   workflow_dispatch:
   push:
     tags:

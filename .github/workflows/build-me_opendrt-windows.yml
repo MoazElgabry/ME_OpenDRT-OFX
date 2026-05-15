@@ -1,6 +1,7 @@
 name: Build ME_OpenDRT Windows (x86_64 CUDA/OpenCL/CPU)
 
 on:
+  workflow_call:
   workflow_dispatch:
   push:
     tags:
