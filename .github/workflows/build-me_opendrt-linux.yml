@@ -38,13 +38,18 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++ ocl-icd-opencl-dev libglfw3-dev libgl1-mesa-dev xvfb
+          sudo apt-get install -y cmake ninja-build gcc-10 g++-10 ocl-icd-opencl-dev libglfw3-dev libgl1-mesa-dev xvfb
           sudo apt-get install -y nvidia-cuda-toolkit
+          nvcc --version
+          g++-10 --version
 
       - name: Configure
         run: |
           cmake -S . -B build-linux -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=/usr/bin/gcc-10 \
+            -DCMAKE_CXX_COMPILER=/usr/bin/g++-10 \
+            -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-10 \
             -DME_OPENDRT_LINUX_CUDA=ON \
             -DME_OPENDRT_BUILD_CUBE_VIEWER_STUB=ON
 
