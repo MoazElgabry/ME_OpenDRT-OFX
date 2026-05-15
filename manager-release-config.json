@@ -26,7 +26,7 @@
       "family": "windows",
       "platform": "windows",
       "arch": "x86_64",
-      "assetPattern": "^ME_OpenDRT_.*Windows.*portable\\.zip$",
+      "assetPattern": "^ME_OpenDRT_.*windows.*portable\\.zip$",
       "packageType": "zip",
       "bundleName": "ME_OpenDRT.ofx.bundle",
       "bundleIdentifier": "com.moazelgabry.me-opendrt",
