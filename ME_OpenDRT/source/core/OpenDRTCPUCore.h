@@ -434,6 +434,35 @@ inline void transformBuffer(
   }
 }
 
+inline void transformBufferWithLayout(
+    const float* src,
+    float* dst,
+    int width,
+    int height,
+    size_t srcRowBytes,
+    size_t dstRowBytes,
+    const OpenDRTParams& p,
+    const OpenDRTDerivedParams& d) {
+  const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+  if (srcRowBytes == 0) srcRowBytes = packedRowBytes;
+  if (dstRowBytes == 0) dstRowBytes = packedRowBytes;
+  const size_t srcPitchFloats = srcRowBytes / sizeof(float);
+  const size_t dstPitchFloats = dstRowBytes / sizeof(float);
+  for (int y = 0; y < height; ++y) {
+    const float* srcRow = src + static_cast<size_t>(y) * srcPitchFloats;
+    float* dstRow = dst + static_cast<size_t>(y) * dstPitchFloats;
+    for (int x = 0; x < width; ++x) {
+      const size_t i = static_cast<size_t>(x) * 4u;
+      float3 rgb = make_float3(srcRow[i + 0], srcRow[i + 1], srcRow[i + 2]);
+      rgb = transformPixel(width, height, x, y, rgb, &p, &d);
+      dstRow[i + 0] = rgb.x;
+      dstRow[i + 1] = rgb.y;
+      dstRow[i + 2] = rgb.z;
+      dstRow[i + 3] = srcRow[i + 3];
+    }
+  }
+}
+
 #undef matrix_ap0_to_xyz
 #undef matrix_ap1_to_xyz
 #undef matrix_rec2020_to_xyz

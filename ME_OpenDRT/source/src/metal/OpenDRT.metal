@@ -1,6 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
-#include "../OpenDRTParams.h"
+#include "../../core/OpenDRTParams.h"
 #define make_float3 float3
 #define make_float2 float2
 

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(ME_OpenDRT VERSION 1.2.11 LANGUAGES CXX)
-set(OPENDRT_DISPLAY_VERSION "1.2.11")
+project(ME_OpenDRT VERSION 1.2.12 LANGUAGES CXX)
+set(OPENDRT_DISPLAY_VERSION "1.2.12")
 
 set(PLUGIN_BASENAME "ME_OpenDRT")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.me_opendrt")
@@ -12,12 +12,16 @@ set(VIEWER_ICON_SVG "${SHARED_ICON_DIR}/OpenDRT_Cube.svg")
 # OpenDRT_Cube.svg matches the existing shared raster used for the LUT viewer icon.
 set(VIEWER_ICON_PNG "${SHARED_ICON_DIR}/Cube 2.png")
 set(GENERATED_ASSET_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
-option(ME_OPENDRT_LINUX_CUDA "Enable CUDA backend in the Linux plugin build" ON)
-option(ME_OPENDRT_LINUX_VIEWER_CUDA "Enable CUDA interop path in the Linux cube viewer build" OFF)
+option(ME_OPENDRT_LINUX_CUDA "Enable CUDA backend on Linux builds" ON)
 option(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB "Build cube-viewer transport stub (research)" ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+set(ME_OPENDRT_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/core")
+set(ME_OPENDRT_OFX_HOST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/hosts/ofx")
+set(ME_OPENDRT_SHARED_VIEWER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shared/viewer")
+set(ME_OPENDRT_BACKEND_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 set(OFX_SUPPORT_SOURCES
   ofx-sdk/Support/Library/ofxsCore.cpp
@@ -31,13 +35,11 @@ set(OFX_SUPPORT_SOURCES
 )
 
 set(PLUGIN_SOURCES
-  src/OpenDRT.cpp
+  hosts/ofx/OpenDRTOFXPlugin.cpp
   ${OFX_SUPPORT_SOURCES}
 )
 
-set(ME_OPENDRT_PLUGIN_USES_CUDA OFF)
 if(WIN32 OR (UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA))
-  set(ME_OPENDRT_PLUGIN_USES_CUDA ON)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -62,13 +64,6 @@ if(WIN32 OR (UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA))
   endif()
 
   list(APPEND PLUGIN_SOURCES src/cuda/OpenDRT.cu)
-endif()
-
-set(ME_OPENDRT_VIEWER_USES_CUDA OFF)
-if(WIN32)
-  set(ME_OPENDRT_VIEWER_USES_CUDA ON)
-elseif(UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA AND ME_OPENDRT_LINUX_VIEWER_CUDA)
-  set(ME_OPENDRT_VIEWER_USES_CUDA ON)
 endif()
 
 if(WIN32 OR (UNIX AND NOT APPLE))
@@ -110,7 +105,10 @@ endif()
 target_include_directories(${PLUGIN_BASENAME} PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk/include
   ${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk/Support/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${ME_OPENDRT_CORE_DIR}
+  ${ME_OPENDRT_OFX_HOST_DIR}
+  ${ME_OPENDRT_SHARED_VIEWER_DIR}
+  ${ME_OPENDRT_BACKEND_DIR}
 )
 if(WIN32 OR (UNIX AND NOT APPLE))
   target_include_directories(${PLUGIN_BASENAME} PRIVATE "${OPENCL_KERNEL_HDR_DIR}")
@@ -121,7 +119,7 @@ target_compile_definitions(${PLUGIN_BASENAME} PRIVATE
   _CRT_SECURE_NO_WARNINGS
 )
 
-if(ME_OPENDRT_PLUGIN_USES_CUDA)
+if(WIN32 OR (UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA))
   target_compile_definitions(${PLUGIN_BASENAME} PRIVATE
     OFX_SUPPORTS_CUDARENDER
   )
@@ -174,7 +172,7 @@ if(APPLE)
     # Those flags are not universally supported across Xcode/runner versions,
     # so correctness should live in OpenDRT.metal rather than depending on them.
     COMMAND "${XCRUN_EXECUTABLE}" -sdk macosx metal -std=macos-metal2.4 -mmacosx-version-min=${METAL_MIN_OS} -c "${METAL_SRC}" -o "${METAL_AIR}"
-    DEPENDS "${METAL_SRC}" "${CMAKE_CURRENT_SOURCE_DIR}/src/OpenDRTParams.h"
+    DEPENDS "${METAL_SRC}" "${ME_OPENDRT_CORE_DIR}/OpenDRTParams.h"
     VERBATIM
   )
 
@@ -210,17 +208,12 @@ elseif(APPLE)
   set(OFX_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bundle/${PLUGIN_BASENAME}.ofx.bundle/Contents/MacOS")
   set(OFX_RESOURCES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bundle/${PLUGIN_BASENAME}.ofx.bundle/Contents/Resources")
 elseif(UNIX)
-  set(OFX_STAGE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/bundle/${PLUGIN_BASENAME}.ofx.bundle")
-  set(OFX_BUNDLE_CONTENTS_DIR "${OFX_STAGE_ROOT}/Contents")
-  set(OFX_OUTPUT_DIR "${OFX_BUNDLE_CONTENTS_DIR}/Linux-x86-64")
-  set(OFX_RESOURCES_DIR "${OFX_BUNDLE_CONTENTS_DIR}/Resources")
+  set(OFX_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bundle/${PLUGIN_BASENAME}.ofx.bundle/Contents/Linux-x86-64")
 endif()
 file(MAKE_DIRECTORY "${OFX_OUTPUT_DIR}")
-if(APPLE OR UNIX)
+if(APPLE)
   file(MAKE_DIRECTORY "${OFX_BUNDLE_CONTENTS_DIR}")
   file(MAKE_DIRECTORY "${OFX_RESOURCES_DIR}")
-endif()
-if(APPLE)
   configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Info.plist.in"
     "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
@@ -299,7 +292,7 @@ if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
       tools/cube_viewer_stub/gl/OpenDRTViewerOpenGLPresenter.cpp
     )
   endif()
-  if(ME_OPENDRT_VIEWER_USES_CUDA)
+  if(WIN32 OR (UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA))
     list(APPEND ME_OPENDRT_VIEWER_SOURCES
       src/cuda/OpenDRT.cu
       tools/cube_viewer_stub/cuda/OpenDRTViewerCuda.cu
@@ -313,12 +306,14 @@ if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
     _CRT_SECURE_NO_WARNINGS
   )
   target_include_directories(ME_OpenDRT_CubeViewer PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${ME_OPENDRT_CORE_DIR}
+    ${ME_OPENDRT_SHARED_VIEWER_DIR}
+    ${ME_OPENDRT_BACKEND_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk/include
     ${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk/Support/include
     $<$<BOOL:${OPENCL_KERNEL_HDR_DIR}>:${OPENCL_KERNEL_HDR_DIR}>
   )
-  if(ME_OPENDRT_VIEWER_USES_CUDA)
+  if(WIN32 OR (UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA))
     target_compile_definitions(ME_OpenDRT_CubeViewer PRIVATE OFX_SUPPORTS_CUDARENDER)
     target_include_directories(ME_OpenDRT_CubeViewer PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
     set_target_properties(ME_OpenDRT_CubeViewer PROPERTIES

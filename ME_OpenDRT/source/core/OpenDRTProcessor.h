@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <sstream>
@@ -96,6 +97,7 @@ class OpenDRTProcessor {
 #endif
 #if defined(ME_OPENDRT_HAS_OPENCL)
     releaseOpenCL();
+    releaseHostOpenCL();
 #endif
   }
 
@@ -112,9 +114,7 @@ class OpenDRTProcessor {
       size_t srcRowBytes,
       size_t dstRowBytes) {
     computeDerivedParams();
-    (void)srcRowBytes;
-    (void)dstRowBytes;
-    return renderCPU(src, dst, width, height);
+    return renderCPUWithLayout(src, dst, width, height, srcRowBytes, dstRowBytes);
   }
 
   bool renderWithLayout(
@@ -156,7 +156,7 @@ class OpenDRTProcessor {
     }
 #endif
     // Last-resort correctness fallback; should never crash the host.
-    return renderCPU(src, dst, width, height);
+    return renderCPUWithLayout(src, dst, width, height, srcRowBytes, dstRowBytes);
   }
 
 #if defined(ME_OPENDRT_HAS_CUDA)
@@ -490,6 +490,164 @@ class OpenDRTProcessor {
   }
 #endif
 
+  bool renderOpenCLHostBuffers(
+      const void* srcOpenCLBuffer,
+      void* dstOpenCLBuffer,
+      int width,
+      int height,
+      size_t srcRowBytes,
+      size_t dstRowBytes,
+      void* hostOpenCLCmdQ) {
+#if !defined(ME_OPENDRT_HAS_OPENCL)
+    (void)srcOpenCLBuffer;
+    (void)dstOpenCLBuffer;
+    (void)width;
+    (void)height;
+    (void)srcRowBytes;
+    (void)dstRowBytes;
+    (void)hostOpenCLCmdQ;
+    return false;
+#else
+    if (openclDisableEnabled_) return false;
+    std::lock_guard<std::mutex> lock(hostOpenCLMutex_);
+    if (srcOpenCLBuffer == nullptr || dstOpenCLBuffer == nullptr || hostOpenCLCmdQ == nullptr ||
+        width <= 0 || height <= 0) {
+      return false;
+    }
+
+    const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+    if (srcRowBytes == 0) srcRowBytes = packedRowBytes;
+    if (dstRowBytes == 0) dstRowBytes = packedRowBytes;
+    if (srcRowBytes < packedRowBytes || dstRowBytes < packedRowBytes ||
+        (srcRowBytes % sizeof(float)) != 0 || (dstRowBytes % sizeof(float)) != 0) {
+      return false;
+    }
+    const size_t srcPitchFloatsSize = srcRowBytes / sizeof(float);
+    const size_t dstPitchFloatsSize = dstRowBytes / sizeof(float);
+    if (srcPitchFloatsSize > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+        dstPitchFloatsSize > static_cast<size_t>(std::numeric_limits<int>::max())) {
+      return false;
+    }
+    const int srcPitchFloats = static_cast<int>(srcPitchFloatsSize);
+    const int dstPitchFloats = static_cast<int>(dstPitchFloatsSize);
+
+    cl_command_queue queue = reinterpret_cast<cl_command_queue>(hostOpenCLCmdQ);
+    if (!ensureHostOpenCLRuntime(queue)) return false;
+
+    computeDerivedParams();
+
+    cl_mem srcBuffer = reinterpret_cast<cl_mem>(const_cast<void*>(srcOpenCLBuffer));
+    cl_mem dstBuffer = reinterpret_cast<cl_mem>(dstOpenCLBuffer);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (clSetKernelArg(hostClKernel_, 0, sizeof(cl_mem), &srcBuffer) != CL_SUCCESS) return false;
+    if (clSetKernelArg(hostClKernel_, 1, sizeof(cl_mem), &dstBuffer) != CL_SUCCESS) return false;
+    if (clSetKernelArg(hostClKernel_, 2, sizeof(int), &width) != CL_SUCCESS) return false;
+    if (clSetKernelArg(hostClKernel_, 3, sizeof(int), &height) != CL_SUCCESS) return false;
+    if (clSetKernelArg(hostClKernel_, 4, sizeof(int), &srcPitchFloats) != CL_SUCCESS) return false;
+    if (clSetKernelArg(hostClKernel_, 5, sizeof(int), &dstPitchFloats) != CL_SUCCESS) return false;
+    if (clSetKernelArg(hostClKernel_, 6, sizeof(OpenDRTParams), &params_) != CL_SUCCESS) return false;
+    if (clSetKernelArg(hostClKernel_, 7, sizeof(OpenDRTDerivedParams), &derived_) != CL_SUCCESS) return false;
+
+    const size_t global[2] = {static_cast<size_t>(width), static_cast<size_t>(height)};
+    if (clEnqueueNDRangeKernel(queue, hostClKernel_, 2, nullptr, global, nullptr, 0, nullptr, nullptr) != CL_SUCCESS) {
+      return false;
+    }
+    lastBackend_ = RuntimeBackend::OpenCL;
+    perfLogStage("OpenCL host buffer enqueue", t0);
+    return true;
+#endif
+  }
+
+  bool readOpenCLHostBuffers(
+      const void* srcOpenCLBuffer,
+      const void* dstOpenCLBuffer,
+      int width,
+      int height,
+      size_t srcRowBytes,
+      size_t dstRowBytes,
+      void* hostOpenCLCmdQ,
+      float* readbackSrc,
+      size_t readbackSrcRowBytes,
+      float* readbackDst,
+      size_t readbackDstRowBytes) {
+#if !defined(ME_OPENDRT_HAS_OPENCL)
+    (void)srcOpenCLBuffer;
+    (void)dstOpenCLBuffer;
+    (void)width;
+    (void)height;
+    (void)srcRowBytes;
+    (void)dstRowBytes;
+    (void)hostOpenCLCmdQ;
+    (void)readbackSrc;
+    (void)readbackSrcRowBytes;
+    (void)readbackDst;
+    (void)readbackDstRowBytes;
+    return false;
+#else
+    if (openclDisableEnabled_) return false;
+    if (srcOpenCLBuffer == nullptr || dstOpenCLBuffer == nullptr || hostOpenCLCmdQ == nullptr ||
+        readbackSrc == nullptr || readbackDst == nullptr || width <= 0 || height <= 0) {
+      return false;
+    }
+
+    const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+    if (srcRowBytes == 0) srcRowBytes = packedRowBytes;
+    if (dstRowBytes == 0) dstRowBytes = packedRowBytes;
+    if (readbackSrcRowBytes == 0) readbackSrcRowBytes = packedRowBytes;
+    if (readbackDstRowBytes == 0) readbackDstRowBytes = packedRowBytes;
+    if (srcRowBytes < packedRowBytes || dstRowBytes < packedRowBytes ||
+        readbackSrcRowBytes < packedRowBytes || readbackDstRowBytes < packedRowBytes) {
+      return false;
+    }
+
+    cl_command_queue queue = reinterpret_cast<cl_command_queue>(hostOpenCLCmdQ);
+    cl_mem srcBuffer = reinterpret_cast<cl_mem>(const_cast<void*>(srcOpenCLBuffer));
+    cl_mem dstBuffer = reinterpret_cast<cl_mem>(const_cast<void*>(dstOpenCLBuffer));
+    const size_t bufferOrigin[3] = {0, 0, 0};
+    const size_t hostOrigin[3] = {0, 0, 0};
+    const size_t region[3] = {packedRowBytes, static_cast<size_t>(height), 1};
+    const auto t0 = std::chrono::steady_clock::now();
+
+    // Viewer cloud readback is ancillary and only runs after host-OpenCL render success.
+    // Finish first so this remains correct even if a host gives us an out-of-order queue.
+    if (clFinish(queue) != CL_SUCCESS) return false;
+    cl_int err = clEnqueueReadBufferRect(
+        queue,
+        srcBuffer,
+        CL_TRUE,
+        bufferOrigin,
+        hostOrigin,
+        region,
+        srcRowBytes,
+        0,
+        readbackSrcRowBytes,
+        0,
+        readbackSrc,
+        0,
+        nullptr,
+        nullptr);
+    if (err != CL_SUCCESS) return false;
+    err = clEnqueueReadBufferRect(
+        queue,
+        dstBuffer,
+        CL_TRUE,
+        bufferOrigin,
+        hostOrigin,
+        region,
+        dstRowBytes,
+        0,
+        readbackDstRowBytes,
+        0,
+        readbackDst,
+        0,
+        nullptr,
+        nullptr);
+    if (err != CL_SUCCESS) return false;
+    perfLogStage("OpenCL host buffer readback", t0);
+    return true;
+#endif
+  }
+
   // OpenCL path for non-CUDA systems (primarily AMD/Intel GPUs on Windows).
   // Uses persistent runtime objects and buffers to avoid per-frame setup overhead.
   bool renderOpenCL(
@@ -604,11 +762,29 @@ class OpenDRTProcessor {
   }
 
   bool renderCPU(const float* src, float* dst, int width, int height) {
+    const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+    return renderCPUWithLayout(src, dst, width, height, packedRowBytes, packedRowBytes);
+  }
+
+  bool renderCPUWithLayout(
+      const float* src,
+      float* dst,
+      int width,
+      int height,
+      size_t srcRowBytes,
+      size_t dstRowBytes) {
+    const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+    if (srcRowBytes == 0) srcRowBytes = packedRowBytes;
+    if (dstRowBytes == 0) dstRowBytes = packedRowBytes;
+    if (srcRowBytes < packedRowBytes || dstRowBytes < packedRowBytes ||
+        (srcRowBytes % sizeof(float)) != 0 || (dstRowBytes % sizeof(float)) != 0) {
+      return false;
+    }
     // CPU fallback now runs the same resolved transform model used by the GPU paths.
     // This preserves viewer usefulness in ME_OPENDRT_VIEWER_CPU_ONLY mode and makes
     // plugin CPU fallback visually meaningful instead of pass-through.
     lastBackend_ = RuntimeBackend::CPU;
-    OpenDRTCPU::transformBuffer(src, dst, width, height, params_, derived_);
+    OpenDRTCPU::transformBufferWithLayout(src, dst, width, height, srcRowBytes, dstRowBytes, params_, derived_);
     return true;
   }
 
@@ -903,6 +1079,55 @@ class OpenDRTProcessor {
 
   static void moduleAnchor() {}
 
+  bool ensureHostOpenCLRuntime(cl_command_queue queue) {
+    cl_context context = nullptr;
+    cl_device_id device = nullptr;
+    if (clGetCommandQueueInfo(queue, CL_QUEUE_CONTEXT, sizeof(context), &context, nullptr) != CL_SUCCESS ||
+        context == nullptr) {
+      return false;
+    }
+    if (clGetCommandQueueInfo(queue, CL_QUEUE_DEVICE, sizeof(device), &device, nullptr) != CL_SUCCESS ||
+        device == nullptr) {
+      return false;
+    }
+    if (hostClKernel_ != nullptr && hostClProgram_ != nullptr && hostClContext_ == context && hostClDevice_ == device) {
+      return true;
+    }
+
+    releaseHostOpenCL();
+    cl_int err = CL_SUCCESS;
+    const char* src = kOpenDRTCLSource;
+    const size_t len = kOpenDRTCLSourceSize;
+    hostClProgram_ = clCreateProgramWithSource(context, 1, &src, &len, &err);
+    if (err != CL_SUCCESS || hostClProgram_ == nullptr) {
+      releaseHostOpenCL();
+      return false;
+    }
+    err = clBuildProgram(hostClProgram_, 1, &device, nullptr, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+      if (debugLogEnabled_) {
+        size_t logSize = 0;
+        clGetProgramBuildInfo(hostClProgram_, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize);
+        if (logSize > 1) {
+          std::vector<char> log(logSize);
+          clGetProgramBuildInfo(hostClProgram_, device, CL_PROGRAM_BUILD_LOG, logSize, log.data(), nullptr);
+          std::fprintf(stderr, "[ME_OpenDRT] Host OpenCL build log:\n%s\n", log.data());
+        }
+      }
+      releaseHostOpenCL();
+      return false;
+    }
+    hostClKernel_ = clCreateKernel(hostClProgram_, "OpenDRTKernelPitched", &err);
+    if (err != CL_SUCCESS || hostClKernel_ == nullptr) {
+      releaseHostOpenCL();
+      return false;
+    }
+    hostClContext_ = context;
+    hostClDevice_ = device;
+    if (debugLogEnabled_) debugLog("Host OpenCL buffer runtime initialized.");
+    return true;
+  }
+
   bool ensureOpenCLBuffers(size_t bytes) {
     if (clSrc_ != nullptr && clDst_ != nullptr && clParams_ != nullptr && clDerived_ != nullptr && clBytes_ == bytes) {
       return true;
@@ -937,6 +1162,13 @@ class OpenDRTProcessor {
     if (clContext_ != nullptr) { clReleaseContext(clContext_); clContext_ = nullptr; }
     clDevice_ = nullptr;
     clPlatform_ = nullptr;
+  }
+
+  void releaseHostOpenCL() {
+    if (hostClKernel_ != nullptr) { clReleaseKernel(hostClKernel_); hostClKernel_ = nullptr; }
+    if (hostClProgram_ != nullptr) { clReleaseProgram(hostClProgram_); hostClProgram_ = nullptr; }
+    hostClContext_ = nullptr;
+    hostClDevice_ = nullptr;
   }
 
   // ----- CUDA runtime lifecycle -----
@@ -1140,6 +1372,11 @@ class OpenDRTProcessor {
   cl_mem clDerived_ = nullptr;
   size_t clBytes_ = 0;
   std::mutex openclMutex_;
+  cl_context hostClContext_ = nullptr;
+  cl_device_id hostClDevice_ = nullptr;
+  cl_program hostClProgram_ = nullptr;
+  cl_kernel hostClKernel_ = nullptr;
+  std::mutex hostOpenCLMutex_;
 #endif
 #if defined(ME_OPENDRT_HAS_CUDA)
   bool cudaAvailability_ = false;

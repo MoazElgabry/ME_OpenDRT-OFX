@@ -1,9 +1,11 @@
+// OFX host entrypoint and Resolve-specific host glue live here.
 #include <cmath>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #if !defined(__linux__)
 #include <filesystem>
 #endif
@@ -75,6 +77,15 @@ bool forceStageCopyEnabled() {
     return !(v[0] == '0' && v[1] == '\0');
   }();
   return enabled;
+}
+
+bool hostOpenCLDisabled() {
+  static const bool disabled = []() {
+    const char* v = std::getenv("ME_OPENDRT_DISABLE_HOST_OPENCL");
+    if (v == nullptr || v[0] == '\0') return false;
+    return !(v[0] == '0' && v[1] == '\0');
+  }();
+  return disabled;
 }
 
 enum class CudaRenderMode {
@@ -644,8 +655,20 @@ struct UserTonescalePreset {
   TonescalePresetValues values{};
 };
 
+struct StartupDefaultSettings {
+  int inGamut = 14;
+  int inOetf = 1;
+  int displayEncodingPreset = 0;
+  float greyLuminance = 10.0f;
+  int lookPreset = 0;
+  int tonescalePreset = 0;
+  int creativeWhitePreset = 0;
+  float creativeWhiteLimit = 0.25f;
+};
+
 struct UserPresetStore {
   bool loaded = false;
+  StartupDefaultSettings startupDefaults;
   std::vector<UserLookPreset> lookPresets;
   std::vector<UserTonescalePreset> tonescalePresets;
 };
@@ -655,6 +678,31 @@ struct UserPresetStore {
 UserPresetStore& userPresetStore() {
   static UserPresetStore store;
   return store;
+}
+
+StartupDefaultSettings factoryStartupDefaultSettings() {
+  return StartupDefaultSettings{};
+}
+
+StartupDefaultSettings clampStartupDefaultSettingsBasic(StartupDefaultSettings s) {
+  s.inGamut = std::clamp(s.inGamut, 0, 14);
+  s.inOetf = std::clamp(s.inOetf, 0, 9);
+  s.displayEncodingPreset = std::clamp(s.displayEncodingPreset, 0, kBuiltInDisplayPresetCount - 1);
+  s.greyLuminance = std::clamp(s.greyLuminance, 3.0f, 25.0f);
+  s.lookPreset = std::max(0, s.lookPreset);
+  s.tonescalePreset = std::max(0, s.tonescalePreset);
+  s.creativeWhitePreset = std::clamp(s.creativeWhitePreset, 0, 6);
+  s.creativeWhiteLimit = std::clamp(s.creativeWhiteLimit, 0.0f, 1.0f);
+  return s;
+}
+
+StartupDefaultSettings clampStartupDefaultSettingsForStore(StartupDefaultSettings s, const UserPresetStore& store) {
+  s = clampStartupDefaultSettingsBasic(s);
+  const int maxLook = kBuiltInLookPresetCount + static_cast<int>(store.lookPresets.size()) - 1;
+  const int maxTone = kBuiltInTonescalePresetCount + static_cast<int>(store.tonescalePresets.size()) - 1;
+  s.lookPreset = (s.lookPreset > maxLook) ? 0 : s.lookPreset;
+  s.tonescalePreset = (s.tonescalePreset > maxTone) ? 0 : s.tonescalePreset;
+  return s;
 }
 
 std::mutex& userPresetMutex() {
@@ -1402,10 +1450,16 @@ std::string tonescaleValuesAsDctl(const TonescalePresetValues& v) {
 
 // ===== JSON Object Utilities: lightweight field extraction/pretty printing =====
 std::string jsonField(const std::string& line, const std::string& key) {
-  const std::string token = "\"" + key + "\":\"";
+  const std::string token = "\"" + key + "\"";
   const size_t p = line.find(token);
   if (p == std::string::npos) return std::string();
   size_t i = p + token.size();
+  while (i < line.size() && std::isspace(static_cast<unsigned char>(line[i]))) ++i;
+  if (i >= line.size() || line[i] != ':') return std::string();
+  ++i;
+  while (i < line.size() && std::isspace(static_cast<unsigned char>(line[i]))) ++i;
+  if (i >= line.size() || line[i] != '"') return std::string();
+  ++i;
   std::string out;
   bool esc = false;
   for (; i < line.size(); ++i) {
@@ -1568,6 +1622,38 @@ bool jsonNumberFieldAs(const std::string& obj, const char* key, T* out) {
   return true;
 }
 
+std::string startupDefaultSettingsAsJson(StartupDefaultSettings s) {
+  s = clampStartupDefaultSettingsBasic(s);
+  std::ostringstream os;
+  os << "{";
+  os << "\"inGamut\":" << s.inGamut << ",";
+  os << "\"inOetf\":" << s.inOetf << ",";
+  os << "\"displayEncodingPreset\":" << s.displayEncodingPreset << ",";
+  os << "\"greyLuminance\":" << s.greyLuminance << ",";
+  os << "\"lookPreset\":" << s.lookPreset << ",";
+  os << "\"tonescalePreset\":" << s.tonescalePreset << ",";
+  os << "\"creativeWhitePreset\":" << s.creativeWhitePreset << ",";
+  os << "\"creativeWhiteLimit\":" << s.creativeWhiteLimit;
+  os << "}";
+  return os.str();
+}
+
+bool parseStartupDefaultSettingsFromJson(const std::string& obj, StartupDefaultSettings* out) {
+  if (!out || obj.empty()) return false;
+  StartupDefaultSettings s = *out;
+  double d = 0.0;
+  if (jsonNumberField(obj, "inGamut", &d)) s.inGamut = static_cast<int>(std::llround(d));
+  if (jsonNumberField(obj, "inOetf", &d)) s.inOetf = static_cast<int>(std::llround(d));
+  if (jsonNumberField(obj, "displayEncodingPreset", &d)) s.displayEncodingPreset = static_cast<int>(std::llround(d));
+  if (jsonNumberField(obj, "greyLuminance", &d)) s.greyLuminance = static_cast<float>(d);
+  if (jsonNumberField(obj, "lookPreset", &d)) s.lookPreset = static_cast<int>(std::llround(d));
+  if (jsonNumberField(obj, "tonescalePreset", &d)) s.tonescalePreset = static_cast<int>(std::llround(d));
+  if (jsonNumberField(obj, "creativeWhitePreset", &d)) s.creativeWhitePreset = static_cast<int>(std::llround(d));
+  if (jsonNumberField(obj, "creativeWhiteLimit", &d)) s.creativeWhiteLimit = static_cast<float>(d);
+  *out = clampStartupDefaultSettingsBasic(s);
+  return true;
+}
+
 bool parseLookValuesFromNamedJson(const std::string& obj, LookPresetValues* v) {
   if (!v || obj.empty()) return false;
   auto reqD = [&](const char* k, auto* d) -> bool { return jsonNumberFieldAs(obj, k, d); };
@@ -1629,8 +1715,10 @@ void saveUserPresetStoreLocked() {
 
   UserPresetStore& s = userPresetStore();
   os << "{\n";
-  os << "  \"schemaVersion\":3,\n";
+  s.startupDefaults = clampStartupDefaultSettingsForStore(s.startupDefaults, s);
+  os << "  \"schemaVersion\":4,\n";
   os << "  \"updatedAtUtc\":\"" << jsonEscape(nowUtcIso8601()) << "\",\n";
+  os << "  \"startupDefaults\":" << startupDefaultSettingsAsJson(s.startupDefaults) << ",\n";
   os << "  \"lookPresets\":[\n";
   for (size_t i = 0; i < s.lookPresets.size(); ++i) {
     std::string payload;
@@ -1753,11 +1841,20 @@ void ensureUserPresetStoreLoadedLocked() {
   if (s.loaded) return;
   s = UserPresetStore{};
   s.loaded = true;
+  s.startupDefaults = factoryStartupDefaultSettings();
 
   migrateLegacyV1IfNeededLocked();
 
-  std::ifstream is(userPresetFilePathV2(), std::ios::binary);
-  if (!is.is_open()) return;
+  std::ifstream file(userPresetFilePathV2(), std::ios::binary);
+  if (!file.is_open()) return;
+
+  std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+  if (content.empty()) return;
+
+  const std::string startupDefaultsJson = jsonObjectField(content, "startupDefaults");
+  if (!startupDefaultsJson.empty()) {
+    parseStartupDefaultSettingsFromJson(startupDefaultsJson, &s.startupDefaults);
+  }
 
   enum class Section { None, Look, Tone };
   Section sec = Section::None;
@@ -1765,6 +1862,7 @@ void ensureUserPresetStoreLoadedLocked() {
   std::unordered_map<std::string, bool> seenToneNames;
   for (const char* n : kLookPresetNames) seenLookNames[normalizePresetNameKey(n)] = true;
   for (const char* n : kTonescalePresetNames) seenToneNames[normalizePresetNameKey(n)] = true;
+  std::istringstream is(content);
   std::string line;
   while (std::getline(is, line)) {
     if (line.find("\"lookPresets\"") != std::string::npos) { sec = Section::Look; continue; }
@@ -1811,6 +1909,7 @@ void ensureUserPresetStoreLoadedLocked() {
       seenToneNames[key] = true;
     }
   }
+  s.startupDefaults = clampStartupDefaultSettingsForStore(s.startupDefaults, s);
 }
 
 int findUserLookIndexByNameLocked(const std::string& name) {
@@ -1923,6 +2022,74 @@ std::vector<std::string> visibleUserTonescaleNames() {
   ensureUserPresetStoreLoadedLocked();
   for (const auto& p : userPresetStore().tonescalePresets) out.push_back(p.name);
   return out;
+}
+
+void applyLookValuesToResolved(OpenDRTParams& p, const LookPresetValues& s);
+void applyTonescaleValuesToResolved(OpenDRTParams& p, const TonescalePresetValues& t);
+
+StartupDefaultSettings describeOpenDRTStartupDefaultSettings() {
+  std::lock_guard<std::mutex> lock(userPresetMutex());
+  ensureUserPresetStoreLoadedLocked();
+  UserPresetStore& store = userPresetStore();
+  store.startupDefaults = clampStartupDefaultSettingsForStore(store.startupDefaults, store);
+  return store.startupDefaults;
+}
+
+OpenDRTParams resolveStartupDefaultSettings(StartupDefaultSettings settings,
+                                            StartupDefaultSettings* resolvedSettings = nullptr,
+                                            int* activeLookSlot = nullptr,
+                                            int* activeToneSlot = nullptr) {
+  OpenDRTParams p{};
+  int lookSlot = -1;
+  int toneSlot = -1;
+  {
+    std::lock_guard<std::mutex> lock(userPresetMutex());
+    ensureUserPresetStoreLoadedLocked();
+    const UserPresetStore& store = userPresetStore();
+    settings = clampStartupDefaultSettingsForStore(settings, store);
+    if (settings.lookPreset >= kBuiltInLookPresetCount) {
+      lookSlot = settings.lookPreset - kBuiltInLookPresetCount;
+      if (lookSlot >= 0 && lookSlot < static_cast<int>(store.lookPresets.size())) {
+        applyLookValuesToResolved(p, store.lookPresets[static_cast<size_t>(lookSlot)].values);
+      } else {
+        lookSlot = -1;
+        settings.lookPreset = 0;
+        applyLookPresetToResolved(p, 0);
+      }
+    } else {
+      applyLookPresetToResolved(p, settings.lookPreset);
+    }
+
+    if (settings.tonescalePreset >= kBuiltInTonescalePresetCount) {
+      toneSlot = settings.tonescalePreset - kBuiltInTonescalePresetCount;
+      if (toneSlot >= 0 && toneSlot < static_cast<int>(store.tonescalePresets.size())) {
+        applyTonescaleValuesToResolved(p, store.tonescalePresets[static_cast<size_t>(toneSlot)].values);
+      } else {
+        toneSlot = -1;
+        settings.tonescalePreset = 0;
+      }
+    } else if (settings.tonescalePreset > 0) {
+      applyTonescalePresetToResolved(p, settings.tonescalePreset);
+    }
+  }
+
+  applyDisplayEncodingPreset(p, settings.displayEncodingPreset);
+  p.in_gamut = settings.inGamut;
+  p.in_oetf = settings.inOetf;
+  p.tn_Lp = (p.eotf == 4 || p.eotf == 5) ? 1000.0f : 100.0f;
+  p.tn_gb = 0.13f;
+  p.pt_hdr = 0.5f;
+  p.tn_Lg = settings.greyLuminance;
+  p.crv_enable = 0;
+  p.clamp = 1;
+  p.cwp_lm = settings.creativeWhiteLimit;
+  if (settings.creativeWhitePreset > 0) {
+    p.cwp = settings.creativeWhitePreset - 1;
+  }
+  if (resolvedSettings) *resolvedSettings = settings;
+  if (activeLookSlot) *activeLookSlot = lookSlot;
+  if (activeToneSlot) *activeToneSlot = toneSlot;
+  return p;
 }
 
 // ===== Preset Application Helpers: resolved params and live OFX param writes =====
@@ -2119,7 +2286,9 @@ const char* tooltipForParam(const std::string& name) {
     {"cubeViewerQuality", "Viewer sampling density for the 3D cube (Low=25^3, about 45k points; Medium=41^3, about 90k points; High=57^3, about 180k points)."},
     {"cubeViewerShowOverflow", "Allow the viewer plot to extend outside the nominal cube bounds instead of clamping transformed values back into range."},
     {"cubeViewerHighlightOverflow", "Highlight out-of-bound plotted points in pure red while overflow display is enabled."},
-    {"cubeViewerStatus", "Connection state for external 3D identity-cube viewer."}
+    {"cubeViewerStatus", "Connection state for external 3D identity-cube viewer."},
+    {"userPresetSaveDefault", "Save the current startup defaults for new OpenDRT instances after the next plugin or host restart."},
+    {"userPresetResetDefault", "Restore the factory startup defaults for new OpenDRT instances after the next plugin or host restart."}
   };
   auto it = kTooltips.find(name);
   return it == kTooltips.end() ? nullptr : it->second;
@@ -2136,6 +2305,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     syncPresetMenusFromDisk(0.0, getChoice("lookPreset", 0.0, 0), getChoice("tonescalePreset", 0.0, 0));
     suppressParamChanged_ = false;
     updateToggleVisibility(0.0);
+    syncCubeViewerOverflowUi(0.0);
     updatePresetManagerActionState(0.0);
     updateReadonlyDisplayLabels(0.0);
     cubeViewerLive_ = getBool("cubeViewerLive", 0.0, 1) != 0;
@@ -2171,6 +2341,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
 void render(const OFX::RenderArguments& args) override {
     const auto tRenderStart = std::chrono::steady_clock::now();
     updateToggleVisibility(args.time);
+    syncCubeViewerOverflowUi(args.time);
     refreshCubeViewerRuntimeStateRenderSafe();
     std::unique_ptr<OFX::Image> src(srcClip_->fetchImage(args.time));
     std::unique_ptr<OFX::Image> dst(dstClip_->fetchImage(args.time));
@@ -2225,14 +2396,12 @@ void render(const OFX::RenderArguments& args) override {
       // Direct path assumes monotonically increasing rows with positive pitch.
       // Some hosts can expose reverse/negative row stepping; use staged path there.
       if (step <= 0) return RowLayout{};
+      if (static_cast<size_t>(step) < rowBytes) return RowLayout{};
       out.valid = true;
       out.pitchBytes = static_cast<size_t>(step);
       out.contiguous = (out.pitchBytes == rowBytes);
       return out;
     };
-    const RowLayout srcLayout = detectLayout(src.get());
-    const RowLayout dstLayout = detectLayout(dst.get());
-
     const auto tResolveStart = std::chrono::steady_clock::now();
     OpenDRTRawValues raw = readRawValues(args.time);
     OpenDRTParams params = resolveParams(raw);
@@ -2347,6 +2516,100 @@ void render(const OFX::RenderArguments& args) override {
     }
 #endif
 
+#if defined(OFX_SUPPORTS_OPENCLRENDER) && !defined(__APPLE__)
+    // Host OpenCL mode:
+    // - Used only when the OFX host enables OpenCL rendering for this action.
+    // - This is the intended AMD/Windows fast fallback after CUDA is unavailable or disabled.
+    // - Uses host cl_mem buffers and host command queue, so it avoids CPU staging copies.
+    if (args.isEnabledOpenCLRender) {
+      if (hostOpenCLDisabled() || args.pOpenCLCmdQ == nullptr) {
+        if (debugLogEnabled()) {
+          std::fprintf(
+              stderr,
+              "[ME_OpenDRT] Host OpenCL render was requested but is %s.\n",
+              hostOpenCLDisabled() ? "disabled by ME_OPENDRT_DISABLE_HOST_OPENCL" : "missing a command queue");
+        }
+        OFX::throwSuiteStatusException(kOfxStatFailed);
+      }
+
+      const auto tHostOpenCL = std::chrono::steady_clock::now();
+      if (src->getOpenCLImage() != nullptr || dst->getOpenCLImage() != nullptr) {
+        if (debugLogEnabled()) {
+          std::fprintf(stderr, "[ME_OpenDRT] Host OpenCL images are not supported yet; buffer render expected.\n");
+        }
+        OFX::throwSuiteStatusException(kOfxStatFailed);
+      }
+
+      const void* srcOpenCLBuffer = src->getPixelData();
+      void* dstOpenCLBuffer = dst->getPixelData();
+      const int srcRb = src->getRowBytes();
+      const int dstRb = dst->getRowBytes();
+      const size_t srcRowBytes = srcRb < 0 ? static_cast<size_t>(-srcRb) : static_cast<size_t>(srcRb);
+      const size_t dstRowBytes = dstRb < 0 ? static_cast<size_t>(-dstRb) : static_cast<size_t>(dstRb);
+      const bool needHostOpenCLReadback = needFirstCloudHandoff || canUpdateInputCloudCache;
+      if (srcOpenCLBuffer != nullptr && dstOpenCLBuffer != nullptr &&
+          processor_->renderOpenCLHostBuffers(
+              srcOpenCLBuffer,
+              dstOpenCLBuffer,
+              width,
+              height,
+              srcRowBytes,
+              dstRowBytes,
+              args.pOpenCLCmdQ)) {
+        if (needHostOpenCLReadback) {
+          const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+          const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+          if (ensureStageBuffers(pixelCount)) {
+            float* srcStage = stageSrcPtr();
+            float* dstStage = stageDstPtr();
+            if (srcStage != nullptr && dstStage != nullptr &&
+                processor_->readOpenCLHostBuffers(
+                    srcOpenCLBuffer,
+                    dstOpenCLBuffer,
+                    width,
+                    height,
+                    srcRowBytes,
+                    dstRowBytes,
+                    args.pOpenCLCmdQ,
+                    srcStage,
+                    packedRowBytes,
+                    dstStage,
+                    packedRowBytes)) {
+              CachedCubeViewerInputCloud cloudPayload{};
+              if (buildCubeViewerInputCloudPayload(
+                      args.time, srcStage, packedRowBytes, dstStage, packedRowBytes, width, height, &cloudPayload)) {
+                if (needFirstCloudHandoff || canUpdateInputCloudCache) {
+                  maybeCaptureCubeViewerInputCloudCache(cloudPayload);
+                }
+                if (needFirstCloudHandoff || needSteadyStateCloud) {
+                  (void)sendCubeViewerInputCloudPayload(
+                      cloudPayload,
+                      false,
+                      needFirstCloudHandoff ? "first-handoff/host-opencl-readback" : "steady-state/host-opencl-readback");
+                }
+              } else if (debugLogEnabled()) {
+                std::fprintf(stderr, "[ME_OpenDRT] Cube input cloud build failed after host-OpenCL readback.\n");
+              }
+            } else if (debugLogEnabled()) {
+              std::fprintf(stderr, "[ME_OpenDRT] Cube input cloud host-OpenCL readback failed.\n");
+            }
+          } else if (debugLogEnabled()) {
+            std::fprintf(stderr, "[ME_OpenDRT] Cube input cloud host-OpenCL staging allocation failed.\n");
+          }
+        }
+        perfLog("Backend render host OpenCL", tHostOpenCL);
+        perfLog("Render total", tRenderStart);
+        return;
+      }
+
+      if (debugLogEnabled()) {
+        std::fprintf(stderr, "[ME_OpenDRT] Host OpenCL buffer render failed.\n");
+      }
+      // Host OpenCL images may not expose CPU-readable pointers; do not fall through to CPU staging.
+      OFX::throwSuiteStatusException(kOfxStatFailed);
+    }
+#endif
+
 #if defined(__APPLE__)
     // Host Metal mode (macOS):
     // - Uses host-provided command queue + MTLBuffer image handles.
@@ -2444,6 +2707,8 @@ void render(const OFX::RenderArguments& args) override {
     const float* renderedDstBase = nullptr;
     size_t renderedSrcPitch = 0;
     size_t renderedDstPitch = 0;
+    const RowLayout srcLayout = detectLayout(src.get());
+    const RowLayout dstLayout = detectLayout(dst.get());
     // Fast path: process directly on host image memory layout (no extra staging vectors).
     if (!forceStageCopyEnabled() && srcLayout.valid && dstLayout.valid) {
       const auto tBackendDirect = std::chrono::steady_clock::now();
@@ -2538,6 +2803,7 @@ void render(const OFX::RenderArguments& args) override {
   void syncPrivateData() override {
     refreshCubeViewerConnectionHealth();
     flushPendingCubeViewerStatusLabel();
+    syncCubeViewerOverflowUi(0.0);
   }
 
   // ===== UI Event Entry =====
@@ -2603,12 +2869,12 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         return;
       }
       if (paramName == "cubeViewerShowOverflow") {
-        const bool showOverflow = getBool("cubeViewerShowOverflow", args.time, 1) != 0;
-        if (showOverflow && getBool("cubeViewerHighlightOverflow", args.time, 1) == 0) {
+        const bool showOverflow = currentBoolValue("cubeViewerShowOverflow", args.time, true);
+        if (showOverflow && !currentBoolValue("cubeViewerHighlightOverflow", args.time, true)) {
           FlagScope scope(suppressParamChanged_);
           setBool("cubeViewerHighlightOverflow", 1);
         }
-        setParamVisible("cubeViewerHighlightOverflow", showOverflow);
+        syncCubeViewerOverflowUi(args.time);
         updateToggleVisibility(args.time);
         if (getBool("cubeViewerIdentity", args.time, 1) == 0) {
           cubeViewerInputCloudRefreshPending_ = true;
@@ -2624,6 +2890,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         return;
       }
       if (paramName == "cubeViewerHighlightOverflow") {
+        syncCubeViewerOverflowUi(args.time);
         updateToggleVisibility(args.time);
         if (getBool("cubeViewerIdentity", args.time, 1) == 0) {
           cubeViewerInputCloudRefreshPending_ = true;
@@ -2898,6 +3165,35 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         return;
       }
 
+      if (paramName == "userPresetSaveDefault") {
+        {
+          std::lock_guard<std::mutex> lock(userPresetMutex());
+          ensureUserPresetStoreLoadedLocked();
+          UserPresetStore& store = userPresetStore();
+          store.startupDefaults = clampStartupDefaultSettingsForStore(captureCurrentStartupDefaultSettings(args.time), store);
+          saveUserPresetStoreLocked();
+        }
+        showInfoDialog("ME_OpenDRT defaults saved.\n\nThese defaults will be used for new instances after the next plugin or host restart.");
+        return;
+      }
+
+      if (paramName == "userPresetResetDefault") {
+        StartupDefaultSettings factory = factoryStartupDefaultSettings();
+        {
+          std::lock_guard<std::mutex> lock(userPresetMutex());
+          ensureUserPresetStoreLoadedLocked();
+          UserPresetStore& store = userPresetStore();
+          store.startupDefaults = clampStartupDefaultSettingsForStore(factory, store);
+          saveUserPresetStoreLocked();
+          factory = store.startupDefaults;
+        }
+        FlagScope scope(suppressParamChanged_);
+        applyStartupDefaultSettingsToCurrent(args.time, factory);
+        pushCubeViewerUpdate(args.time, paramName, true);
+        showInfoDialog("ME_OpenDRT defaults reset.\n\nThe factory defaults will be used for new instances after the next plugin or host restart.");
+        return;
+      }
+
       if (paramName == "userLookSave") {
         const std::string name = sanitizePresetName(getString("userPresetName", "User Look"), "User Look");
         const LookPresetValues values = captureCurrentLookValues(args.time);
@@ -2968,13 +3264,19 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         const std::string path = pickOpenJsonFilePath();
         if (path.empty()) return;
         std::ifstream is(path, std::ios::binary);
-        if (!is.is_open()) return;
+        if (!is.is_open()) {
+          showInfoDialog("Could not open the selected preset file.");
+          return;
+        }
         std::string content((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
         const std::string type = jsonField(content, "presetType");
         const std::string name = sanitizePresetName(jsonField(content, "name"), "Imported Preset");
         const std::string payload = jsonField(content, "payload");
         const std::string namedValues = jsonObjectField(content, "namedValues");
-        if (type.empty() || (payload.empty() && namedValues.empty())) return;
+        if (type.empty() || (payload.empty() && namedValues.empty())) {
+          showInfoDialog("The selected file is not a valid ME_OpenDRT preset export.");
+          return;
+        }
 
         FlagScope scope(suppressParamChanged_);
         if (type == "look") {
@@ -2982,7 +3284,10 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
           bool parsedOk = false;
           if (!payload.empty()) parsedOk = parseLookValues(payload, &values);
           if (!parsedOk && !namedValues.empty()) parsedOk = parseLookValuesFromNamedJson(namedValues, &values);
-          if (!parsedOk) return;
+          if (!parsedOk) {
+            showInfoDialog("Could not parse the selected Look preset values.");
+            return;
+          }
           int index = -1;
           {
             std::lock_guard<std::mutex> lock(userPresetMutex());
@@ -3007,7 +3312,10 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
           bool parsedOk = false;
           if (!payload.empty()) parsedOk = parseTonescaleValues(payload, &values);
           if (!parsedOk && !namedValues.empty()) parsedOk = parseTonescaleValuesFromNamedJson(namedValues, &values);
-          if (!parsedOk) return;
+          if (!parsedOk) {
+            showInfoDialog("Could not parse the selected Tonescale preset values.");
+            return;
+          }
           int index = -1;
           {
             std::lock_guard<std::mutex> lock(userPresetMutex());
@@ -3027,6 +3335,9 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
           if (idx >= 0) setChoice("tonescalePreset", idx);
           setInt("activeUserToneSlot", index);
           writeTonescaleValuesToParams(values, *this);
+        } else {
+          showInfoDialog("Unsupported preset type in the selected file.");
+          return;
         }
         updateToggleVisibility(args.time);
         pushCubeViewerUpdate(args.time, paramName, true);
@@ -3546,6 +3857,51 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     return v;
   }
 
+  StartupDefaultSettings captureCurrentStartupDefaultSettings(double time) const {
+    StartupDefaultSettings s{};
+    s.inGamut = getChoice("in_gamut", time, 14);
+    s.inOetf = getChoice("in_oetf", time, 1);
+    s.displayEncodingPreset = getChoice("displayEncodingPreset", time, 0);
+    s.greyLuminance = getDouble("tn_Lg", time, 10.0f);
+    s.lookPreset = getChoice("lookPreset", time, 0);
+    s.tonescalePreset = getChoice("tonescalePreset", time, 0);
+    s.creativeWhitePreset = getChoice("creativeWhitePreset", time, 0);
+    s.creativeWhiteLimit = getDouble("cwp_lm", time, 0.25f);
+    return s;
+  }
+
+  void applyStartupDefaultSettingsToCurrent(double time, StartupDefaultSettings settings) {
+    int activeLookSlot = -1;
+    int activeToneSlot = -1;
+    settings = clampStartupDefaultSettingsBasic(settings);
+    const OpenDRTParams p = resolveStartupDefaultSettings(settings, &settings, &activeLookSlot, &activeToneSlot);
+    setChoice("in_gamut", settings.inGamut);
+    setChoice("in_oetf", settings.inOetf);
+    setChoice("displayEncodingPreset", settings.displayEncodingPreset);
+    setChoice("lookPreset", settings.lookPreset);
+    setChoice("tonescalePreset", settings.tonescalePreset);
+    setChoice("creativeWhitePreset", settings.creativeWhitePreset);
+    setInt("activeUserLookSlot", activeLookSlot);
+    setInt("activeUserToneSlot", activeToneSlot);
+    setChoice("display_gamut", p.display_gamut);
+    setChoice("eotf", p.eotf);
+    setChoice("tn_su", p.tn_su);
+    setDouble("tn_Lp", p.tn_Lp);
+    setDouble("tn_Lg", p.tn_Lg);
+    setInt("cwp", p.cwp);
+    setDouble("cwp_lm", p.cwp_lm);
+    applyTonescaleFromBaseline(p);
+    applyRenderSpaceFromBaseline(p);
+    applyMidPurityFromBaseline(p);
+    applyPurityCompressionFromBaseline(p);
+    applyBrillianceFromBaseline(p);
+    applyHueFromBaseline(p);
+    updateToggleVisibility(time);
+    updatePresetManagerActionState(time);
+    updateReadonlyDisplayLabels(time);
+    updatePresetStateFromCurrent(time);
+  }
+
   // ===== Preset Baseline Resolver =====
   // Computes the expected "clean" state for current look/tonescale/display selector choices.
   bool buildPresetBaseline(double time, OpenDRTParams* expected) const {
@@ -3553,6 +3909,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     const int look = getChoice("lookPreset", time, 0);
     const int tsPreset = getChoice("tonescalePreset", time, 0);
     const int displayPreset = getChoice("displayEncodingPreset", time, 0);
+    const int cwpPreset = getChoice("creativeWhitePreset", time, 0);
     OpenDRTParams out{};
     // Step 1: Start from look baseline (built-in or user look payload).
     if (isUserLookPresetIndex(look)) {
@@ -3588,6 +3945,10 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
 
     // Step 3: Apply display preset defaults.
     applyDisplayEncodingPreset(out, displayPreset);
+    if (cwpPreset > 0) {
+      out.cwp = cwpPreset - 1;
+      out.cwp_lm = getDouble("cwp_lm", time, out.cwp_lm);
+    }
     out.clamp = 1;
     *expected = out;
     return true;
@@ -3697,7 +4058,6 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     if (tonescaleCleanOut) *tonescaleCleanOut = tonescaleClean;
 
     const bool creativeWhiteClean =
-      (getChoice("creativeWhitePreset", time, 0) == 0) &&
       (getInt("cwp", time, expected.cwp) == expected.cwp) &&
       almostEqual(getDouble("cwp_lm", time, expected.cwp_lm), expected.cwp_lm);
 
@@ -4123,20 +4483,39 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     }
   }
 
+  bool currentBoolValue(const char* name, double t, bool fallback) {
+    try {
+      if (auto* p = fetchBooleanParam(name)) {
+        bool value = fallback;
+        p->getValue(value);
+        return value;
+      }
+    } catch (...) {
+    }
+    return getBool(name, t, fallback ? 1 : 0) != 0;
+  }
+
+  void syncCubeViewerOverflowUi(double t) {
+    const bool showOverflow = currentBoolValue("cubeViewerShowOverflow", t, true);
+    if (auto* p = fetchBooleanParam("cubeViewerHighlightOverflow")) {
+      p->setIsSecret(!showOverflow);
+      p->setEnabled(showOverflow);
+    }
+  }
+
   // Advanced toggle visibility updater.
   // Uses a small cache to avoid calling setIsSecret/setEnabled unless a driving toggle changed.
   void updateToggleVisibility(double t) {
-    const bool hcon = getBool("tn_hcon_enable", t, 0) != 0;
-    const bool lcon = getBool("tn_lcon_enable", t, 0) != 0;
-    const bool pt = getBool("pt_enable", t, 1) != 0;
-    const bool ptl = getBool("ptl_enable", t, 1) != 0;
-    const bool ptm = getBool("ptm_enable", t, 1) != 0;
-    const bool brl = getBool("brl_enable", t, 1) != 0;
-    const bool brlp = getBool("brlp_enable", t, 1) != 0;
-    const bool hc = getBool("hc_enable", t, 1) != 0;
-    const bool hsRgb = getBool("hs_rgb_enable", t, 1) != 0;
-    const bool hsCmy = getBool("hs_cmy_enable", t, 1) != 0;
-    const bool cubeViewerShowOverflow = getBool("cubeViewerShowOverflow", t, 1) != 0;
+    const bool hcon = currentBoolValue("tn_hcon_enable", t, false);
+    const bool lcon = currentBoolValue("tn_lcon_enable", t, false);
+    const bool pt = currentBoolValue("pt_enable", t, true);
+    const bool ptl = currentBoolValue("ptl_enable", t, true);
+    const bool ptm = currentBoolValue("ptm_enable", t, true);
+    const bool brl = currentBoolValue("brl_enable", t, true);
+    const bool brlp = currentBoolValue("brlp_enable", t, true);
+    const bool hc = currentBoolValue("hc_enable", t, true);
+    const bool hsRgb = currentBoolValue("hs_rgb_enable", t, true);
+    const bool hsCmy = currentBoolValue("hs_cmy_enable", t, true);
 
     if (visibilityCacheInit_ &&
         hcon == vis_hcon_ &&
@@ -4148,8 +4527,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         brlp == vis_brlp_ &&
         hc == vis_hc_ &&
         hsRgb == vis_hsRgb_ &&
-        hsCmy == vis_hsCmy_ &&
-        cubeViewerShowOverflow == vis_cubeViewerShowOverflow_) {
+        hsCmy == vis_hsCmy_) {
       return;
     }
 
@@ -4163,7 +4541,6 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     const bool applyHc = !visibilityCacheInit_ || hc != vis_hc_;
     const bool applyHsRgb = !visibilityCacheInit_ || hsRgb != vis_hsRgb_;
     const bool applyHsCmy = !visibilityCacheInit_ || hsCmy != vis_hsCmy_;
-    const bool applyCubeViewerOverflow = true;
 
     if (applyHcon) {
       setParamVisible("tn_hcon", hcon);
@@ -4230,9 +4607,6 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
       setParamVisible("hs_y", hsCmy);
       setParamVisible("hs_y_rng", hsCmy);
     }
-    if (applyCubeViewerOverflow) {
-      setParamVisible("cubeViewerHighlightOverflow", cubeViewerShowOverflow);
-    }
 
     vis_hcon_ = hcon;
     vis_lcon_ = lcon;
@@ -4244,7 +4618,6 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     vis_hc_ = hc;
     vis_hsRgb_ = hsRgb;
     vis_hsCmy_ = hsCmy;
-    vis_cubeViewerShowOverflow_ = cubeViewerShowOverflow;
     visibilityCacheInit_ = true;
   }
   void setInt(const char* name, int v) {
@@ -5349,7 +5722,6 @@ void closeCubeViewerSession() {
   bool vis_hc_ = false;
   bool vis_hsRgb_ = false;
   bool vis_hsCmy_ = false;
-  bool vis_cubeViewerShowOverflow_ = false;
   bool menuLabelCacheInit_ = false;
   int menuLabelLookIdx_ = -1;
   int menuLabelToneIdx_ = -1;
@@ -5413,7 +5785,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   // ===== Plugin Descriptor =====
   // Host capability advertisement and static metadata.
   void describe(OFX::ImageEffectDescriptor& d) override {
-static const std::string nameWithVersion = "ME_OpenDRT v1.2.11";
+static const std::string nameWithVersion = "ME_OpenDRT v1.2.12";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -5425,7 +5797,12 @@ static const std::string nameWithVersion = "ME_OpenDRT v1.2.11";
     d.setSupportsTiles(false);
     d.setSupportsMultiResolution(false);
     d.setTemporalClipAccess(false);
+#if defined(OFX_SUPPORTS_OPENCLRENDER) && !defined(__APPLE__)
+    d.setSupportsOpenCLBuffersRender(true);
+    d.setSupportsOpenCLImagesRender(false);
+#else
     d.setSupportsOpenCLBuffersRender(false);
+#endif
 #if defined(OFX_SUPPORTS_CUDARENDER)
     const bool advertiseHostCuda = (selectedCudaRenderMode() == CudaRenderMode::HostPreferred);
     d.setSupportsCudaRender(advertiseHostCuda);
@@ -5458,6 +5835,12 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     grpUserPresetsRoot->setLabel("PRESET Manager");
     grpUserPresetsRoot->setOpen(false);
 
+    StartupDefaultSettings startupDefaults = describeOpenDRTStartupDefaultSettings();
+    int defaultActiveUserLookSlot = -1;
+    int defaultActiveUserToneSlot = -1;
+    const OpenDRTParams defaultParams =
+        resolveStartupDefaultSettings(startupDefaults, &startupDefaults, &defaultActiveUserLookSlot, &defaultActiveUserToneSlot);
+
     auto addChoice = [&d](const char* name, const char* label, int def, const std::vector<const char*>& opts) {
       auto* p = d.defineChoiceParam(name);
       p->setLabel(label);
@@ -5476,19 +5859,19 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
       return p;
     };
 
-    auto* inGamut = addChoice("in_gamut", "Input Gamut", 14, {"XYZ","ACES 2065-1","ACEScg","P3D65","Rec.2020","Rec.709","Arri Wide Gamut 3","Arri Wide Gamut 4","Red Wide Gamut RGB","Sony SGamut3","Sony SGamut3Cine","Panasonic V-Gamut","Filmlight E-Gamut","Filmlight E-Gamut2","DaVinci Wide Gamut"});
-    auto* inOetf = addChoice("in_oetf", "Input Transfer Function", 1, {"Linear","DaVinci Intermediate","Filmlight T-Log","ACEScct","Arri LogC3","Arri LogC4","RedLog3G10","Panasonic V-Log","Sony S-Log3","Fuji F-Log2"});
+    auto* inGamut = addChoice("in_gamut", "Input Gamut", startupDefaults.inGamut, {"XYZ","ACES 2065-1","ACEScg","P3D65","Rec.2020","Rec.709","Arri Wide Gamut 3","Arri Wide Gamut 4","Red Wide Gamut RGB","Sony SGamut3","Sony SGamut3Cine","Panasonic V-Gamut","Filmlight E-Gamut","Filmlight E-Gamut2","DaVinci Wide Gamut"});
+    auto* inOetf = addChoice("in_oetf", "Input Transfer Function", startupDefaults.inOetf, {"Linear","DaVinci Intermediate","Filmlight T-Log","ACEScct","Arri LogC3","Arri LogC4","RedLog3G10","Panasonic V-Log","Sony S-Log3","Fuji F-Log2"});
 
-    auto* dep = addChoice("displayEncodingPreset", "Display Encoding Preset", 0, {"Rec.1886 - 2.4 Power / Rec.709","sRGB Display - 2.2 Power / Rec.709","Display P3 - 2.2 Power / P3-D65","DCI - 2.6 Power / P3-D60","DCI - 2.6 Power / P3-DCI","DCI - 2.6 Power / XYZ","Rec.2100 - PQ / Rec.2020","Rec.2100 - HLG / Rec.2020","Dolby - PQ / P3-D65"});
+    auto* dep = addChoice("displayEncodingPreset", "Display Encoding Preset", startupDefaults.displayEncodingPreset, {"Rec.1886 - 2.4 Power / Rec.709","sRGB Display - 2.2 Power / Rec.709","Display P3 - 2.2 Power / P3-D65","DCI - 2.6 Power / P3-D60","DCI - 2.6 Power / P3-DCI","DCI - 2.6 Power / XYZ","Rec.2100 - PQ / Rec.2020","Rec.2100 - HLG / Rec.2020","Dolby - PQ / P3-D65"});
     auto* presetState = d.defineIntParam("presetState"); presetState->setIsSecret(true); presetState->setDefault(0);
-    auto* cwpHidden = d.defineIntParam("cwp"); cwpHidden->setIsSecret(true); cwpHidden->setDefault(2);
-    auto* activeUserLookSlot = d.defineIntParam("activeUserLookSlot"); activeUserLookSlot->setIsSecret(true); activeUserLookSlot->setDefault(-1);
-    auto* activeUserToneSlot = d.defineIntParam("activeUserToneSlot"); activeUserToneSlot->setIsSecret(true); activeUserToneSlot->setDefault(-1);
-    auto* cwpPreset = addChoice("creativeWhitePreset", "Creative White", 0, {"USE LOOK PRESET","D93","D75","D65","D60","D55","D50"});
-    auto* cwpLm = addDouble("cwp_lm", "Creative White Limit", 0.25, 0.0, 1.0);
+    auto* cwpHidden = d.defineIntParam("cwp"); cwpHidden->setIsSecret(true); cwpHidden->setDefault(defaultParams.cwp);
+    auto* activeUserLookSlot = d.defineIntParam("activeUserLookSlot"); activeUserLookSlot->setIsSecret(true); activeUserLookSlot->setDefault(defaultActiveUserLookSlot);
+    auto* activeUserToneSlot = d.defineIntParam("activeUserToneSlot"); activeUserToneSlot->setIsSecret(true); activeUserToneSlot->setDefault(defaultActiveUserToneSlot);
+    auto* cwpPreset = addChoice("creativeWhitePreset", "Creative White", startupDefaults.creativeWhitePreset, {"USE LOOK PRESET","D93","D75","D65","D60","D55","D50"});
+    auto* cwpLm = addDouble("cwp_lm", "Creative White Limit", defaultParams.cwp_lm, 0.0, 1.0);
     auto* baseWpLabel = d.defineStringParam("baseWhitepointLabel");
     baseWpLabel->setLabel("Effective Whitepoint");
-    baseWpLabel->setDefault("D65");
+    baseWpLabel->setDefault(whitepointNameFromCwp(defaultParams.cwp));
     baseWpLabel->setEnabled(false);
     auto* grpBasicRoot = d.defineGroupParam("grp_basic_root");
     grpBasicRoot->setLabel("Basic");
@@ -5502,10 +5885,12 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     activeUserToneSlot->setParent(*grpBasicRoot);
     auto* grpDisplay = d.defineGroupParam("grp_display"); grpDisplay->setLabel("Display Encoding Settings"); grpDisplay->setOpen(false);
     auto* grpPresetSelection = d.defineGroupParam("grp_preset_selection"); grpPresetSelection->setLabel("DRT Look"); grpPresetSelection->setOpen(true);
-    auto* lookPreset = addChoice("lookPreset", "DRT Look Preset", 0, {"Standard","Arriba","Sylvan","Colorful","Aery","Dystopic","Umbra","Base"});
+    auto* lookPreset = addChoice("lookPreset", "DRT Look Preset", std::min(startupDefaults.lookPreset, kBuiltInLookPresetCount - 1), {"Standard","Arriba","Sylvan","Colorful","Aery","Dystopic","Umbra","Base"});
     for (const auto& n : visibleUserLookNames()) lookPreset->appendOption(n);
-    auto* tonescalePreset = addChoice("tonescalePreset", "Tonescale Preset", 0, {"USE LOOK PRESET","Low Contrast","Medium Contrast","High Contrast","Arriba Tonescale","Sylvan Tonescale","Colorful Tonescale","Aery Tonescale","Dystopic Tonescale","Umbra Tonescale","ACES-1.x","ACES-2.0","Marvelous Tonescape","DaGrinchi ToneGroan"});
+    lookPreset->setDefault(startupDefaults.lookPreset);
+    auto* tonescalePreset = addChoice("tonescalePreset", "Tonescale Preset", std::min(startupDefaults.tonescalePreset, kBuiltInTonescalePresetCount - 1), {"USE LOOK PRESET","Low Contrast","Medium Contrast","High Contrast","Arriba Tonescale","Sylvan Tonescale","Colorful Tonescale","Aery Tonescale","Dystopic Tonescale","Umbra Tonescale","ACES-1.x","ACES-2.0","Marvelous Tonescape","DaGrinchi ToneGroan"});
     for (const auto& n : visibleUserTonescaleNames()) tonescalePreset->appendOption(n);
+    tonescalePreset->setDefault(startupDefaults.tonescalePreset);
     lookPreset->setParent(*grpPresetSelection);
     tonescalePreset->setParent(*grpPresetSelection);
     auto* grpAdvancedRoot = d.defineGroupParam("grp_advanced_root"); grpAdvancedRoot->setLabel("Advanced Look Control"); grpAdvancedRoot->setOpen(false);
@@ -5532,100 +5917,100 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     auto addAdvD = [&d](const char* n, const char* l, double df, double mn, double mx, OFX::GroupParamDescriptor* g){ auto* p=d.defineDoubleParam(n); p->setLabel(l); p->setDefault(df); p->setRange(mn,mx); p->setDisplayRange(mn,mx); p->setParent(*g); if (const char* hint = tooltipForParam(n)) p->setHint(hint); return p; };
     auto addAdvC = [&d](const char* n, const char* l, int df, const std::vector<const char*>& o, OFX::GroupParamDescriptor* g){ auto* p=d.defineChoiceParam(n); p->setLabel(l); for(auto* s:o)p->appendOption(s); p->setDefault(df); p->setParent(*g); if (const char* hint = tooltipForParam(n)) p->setHint(hint); return p; };
 
-    addAdvC("display_gamut","Display Gamut",0,{"Rec.709","P3-D65","Rec.2020","P3-D60","P3-DCI","XYZ"},grpDisplay);
-    addAdvC("eotf","Display EOTF",2,{"Linear","2.2 Power sRGB","2.4 Power Rec.1886","2.6 Power DCI","ST 2084 PQ","HLG"},grpDisplay);
-    addAdvD("tn_Lp", "Peak Luminance", 100.0, 100.0, 1000.0, grpDisplay);
-    addAdvD("tn_Lg", "Grey Luminance", 10.0, 3.0, 25.0, grpDisplay);
+    addAdvC("display_gamut","Display Gamut",defaultParams.display_gamut,{"Rec.709","P3-D65","Rec.2020","P3-D60","P3-DCI","XYZ"},grpDisplay);
+    addAdvC("eotf","Display EOTF",defaultParams.eotf,{"Linear","2.2 Power sRGB","2.4 Power Rec.1886","2.6 Power DCI","ST 2084 PQ","HLG"},grpDisplay);
+    addAdvD("tn_Lp", "Peak Luminance", defaultParams.tn_Lp, 100.0, 1000.0, grpDisplay);
+    addAdvD("tn_Lg", "Grey Luminance", defaultParams.tn_Lg, 3.0, 25.0, grpDisplay);
     addAdvD("tn_gb", "HDR Grey Boost", 0.13, 0.0, 1.0, grpDisplay);
     addAdvD("pt_hdr", "HDR Purity", 0.5, 0.0, 1.0, grpDisplay);
-    addAdvC("tn_su","Surround",1,{"Dark","Dim","Bright"},grpDisplay);
-    addAdvBool("clamp","Clamp",true,grpDisplay);
+    addAdvC("tn_su","Surround",defaultParams.tn_su,{"Dark","Dim","Bright"},grpDisplay);
+    addAdvBool("clamp","Clamp",defaultParams.clamp != 0,grpDisplay);
 
     auto* resetTonescale = d.definePushButtonParam("reset_tonescale");
     resetTonescale->setLabel("Reset Tonescale");
     resetTonescale->setParent(*grpTone);
-    addAdvD("tn_con","Contrast",1.66,1.0,2.0,grpTone);
-    addAdvD("tn_sh","Shoulder Clip",0.5,0.0,1.0,grpTone);
-    addAdvD("tn_toe","Toe",0.003,0.0,0.1,grpTone);
-    addAdvD("tn_off","Offset",0.005,0.0,0.02,grpTone);
-    addAdvBool("tn_hcon_enable","Enable Contrast High",false,grpTone);
-    addAdvD("tn_hcon","Contrast High",0.0,-1.0,1.0,grpTone);
-    addAdvD("tn_hcon_pv","Contrast High Pivot",1.0,0.0,4.0,grpTone);
-    addAdvD("tn_hcon_st","Contrast High Strength",4.0,0.0,4.0,grpTone);
-    addAdvBool("tn_lcon_enable","Enable Contrast Low",false,grpTone);
-    addAdvD("tn_lcon","Contrast Low",0.0,0.0,3.0,grpTone);
-    addAdvD("tn_lcon_w","Contrast Low Width",0.5,0.0,2.0,grpTone);
+    addAdvD("tn_con","Contrast",defaultParams.tn_con,1.0,2.0,grpTone);
+    addAdvD("tn_sh","Shoulder Clip",defaultParams.tn_sh,0.0,1.0,grpTone);
+    addAdvD("tn_toe","Toe",defaultParams.tn_toe,0.0,0.1,grpTone);
+    addAdvD("tn_off","Offset",defaultParams.tn_off,0.0,0.02,grpTone);
+    addAdvBool("tn_hcon_enable","Enable Contrast High",defaultParams.tn_hcon_enable != 0,grpTone);
+    addAdvD("tn_hcon","Contrast High",defaultParams.tn_hcon,-1.0,1.0,grpTone);
+    addAdvD("tn_hcon_pv","Contrast High Pivot",defaultParams.tn_hcon_pv,0.0,4.0,grpTone);
+    addAdvD("tn_hcon_st","Contrast High Strength",defaultParams.tn_hcon_st,0.0,4.0,grpTone);
+    addAdvBool("tn_lcon_enable","Enable Contrast Low",defaultParams.tn_lcon_enable != 0,grpTone);
+    addAdvD("tn_lcon","Contrast Low",defaultParams.tn_lcon,0.0,3.0,grpTone);
+    addAdvD("tn_lcon_w","Contrast Low Width",defaultParams.tn_lcon_w,0.0,2.0,grpTone);
 
     auto* resetRenderSpace = d.definePushButtonParam("reset_render_space");
     resetRenderSpace->setLabel("Reset Render Space");
     resetRenderSpace->setParent(*grpRender);
-    addAdvD("rs_sa","Render Space Strength",0.35,0.0,0.6,grpRender);
-    addAdvD("rs_rw","Render Space Weight R",0.25,0.0,0.8,grpRender);
-    addAdvD("rs_bw","Render Space Weight B",0.55,0.0,0.8,grpRender);
+    addAdvD("rs_sa","Render Space Strength",defaultParams.rs_sa,0.0,0.6,grpRender);
+    addAdvD("rs_rw","Render Space Weight R",defaultParams.rs_rw,0.0,0.8,grpRender);
+    addAdvD("rs_bw","Render Space Weight B",defaultParams.rs_bw,0.0,0.8,grpRender);
 
     auto* resetMidPurity = d.definePushButtonParam("reset_mid_purity");
     resetMidPurity->setLabel("Reset Mid Purity");
     resetMidPurity->setParent(*grpMidPurity);
-    addAdvBool("ptm_enable","Enable Mid Purity",true,grpMidPurity);
-    addAdvD("ptm_low","Mid Purity Low",0.4,0.0,2.0,grpMidPurity);
-    addAdvD("ptm_low_rng","Mid Purity Low Range",0.25,0.0,1.0,grpMidPurity);
-    addAdvD("ptm_low_st","Mid Purity Low Strength",0.5,0.1,1.0,grpMidPurity);
-    addAdvD("ptm_high","Mid Purity High",-0.8,-0.9,0.0,grpMidPurity);
-    addAdvD("ptm_high_rng","Mid Purity High Range",0.35,0.0,1.0,grpMidPurity);
-    addAdvD("ptm_high_st","Mid Purity High Strength",0.4,0.1,1.0,grpMidPurity);
+    addAdvBool("ptm_enable","Enable Mid Purity",defaultParams.ptm_enable != 0,grpMidPurity);
+    addAdvD("ptm_low","Mid Purity Low",defaultParams.ptm_low,0.0,2.0,grpMidPurity);
+    addAdvD("ptm_low_rng","Mid Purity Low Range",defaultParams.ptm_low_rng,0.0,1.0,grpMidPurity);
+    addAdvD("ptm_low_st","Mid Purity Low Strength",defaultParams.ptm_low_st,0.1,1.0,grpMidPurity);
+    addAdvD("ptm_high","Mid Purity High",defaultParams.ptm_high,-0.9,0.0,grpMidPurity);
+    addAdvD("ptm_high_rng","Mid Purity High Range",defaultParams.ptm_high_rng,0.0,1.0,grpMidPurity);
+    addAdvD("ptm_high_st","Mid Purity High Strength",defaultParams.ptm_high_st,0.1,1.0,grpMidPurity);
 
     auto* resetPurityCompression = d.definePushButtonParam("reset_purity_compression");
     resetPurityCompression->setLabel("Reset Purity Compression");
     resetPurityCompression->setParent(*grpPurityCompression);
-    addAdvBool("pt_enable","Enable Purity Compress High",true,grpPurityCompression);
-    addAdvD("pt_lml","Purity Limit Low",0.25,0.0,1.0,grpPurityCompression);
-    addAdvD("pt_lml_r","Purity Limit Low R",0.5,0.0,1.0,grpPurityCompression);
-    addAdvD("pt_lml_g","Purity Limit Low G",0.0,0.0,1.0,grpPurityCompression);
-    addAdvD("pt_lml_b","Purity Limit Low B",0.1,0.0,1.0,grpPurityCompression);
-    addAdvD("pt_lmh","Purity Limit High",0.25,0.0,1.0,grpPurityCompression);
-    addAdvD("pt_lmh_r","Purity Limit High R",0.5,0.0,1.0,grpPurityCompression);
-    addAdvD("pt_lmh_b","Purity Limit High B",0.0,0.0,1.0,grpPurityCompression);
-    addAdvBool("ptl_enable","Enable Purity Softclip",true,grpPurityCompression);
-    addAdvD("ptl_c","Purity Softclip C",0.06,0.0,0.25,grpPurityCompression);
-    addAdvD("ptl_m","Purity Softclip M",0.08,0.0,0.25,grpPurityCompression);
-    addAdvD("ptl_y","Purity Softclip Y",0.06,0.0,0.25,grpPurityCompression);
+    addAdvBool("pt_enable","Enable Purity Compress High",defaultParams.pt_enable != 0,grpPurityCompression);
+    addAdvD("pt_lml","Purity Limit Low",defaultParams.pt_lml,0.0,1.0,grpPurityCompression);
+    addAdvD("pt_lml_r","Purity Limit Low R",defaultParams.pt_lml_r,0.0,1.0,grpPurityCompression);
+    addAdvD("pt_lml_g","Purity Limit Low G",defaultParams.pt_lml_g,0.0,1.0,grpPurityCompression);
+    addAdvD("pt_lml_b","Purity Limit Low B",defaultParams.pt_lml_b,0.0,1.0,grpPurityCompression);
+    addAdvD("pt_lmh","Purity Limit High",defaultParams.pt_lmh,0.0,1.0,grpPurityCompression);
+    addAdvD("pt_lmh_r","Purity Limit High R",defaultParams.pt_lmh_r,0.0,1.0,grpPurityCompression);
+    addAdvD("pt_lmh_b","Purity Limit High B",defaultParams.pt_lmh_b,0.0,1.0,grpPurityCompression);
+    addAdvBool("ptl_enable","Enable Purity Softclip",defaultParams.ptl_enable != 0,grpPurityCompression);
+    addAdvD("ptl_c","Purity Softclip C",defaultParams.ptl_c,0.0,0.25,grpPurityCompression);
+    addAdvD("ptl_m","Purity Softclip M",defaultParams.ptl_m,0.0,0.25,grpPurityCompression);
+    addAdvD("ptl_y","Purity Softclip Y",defaultParams.ptl_y,0.0,0.25,grpPurityCompression);
 
     auto* resetBrilliance = d.definePushButtonParam("reset_brilliance");
     resetBrilliance->setLabel("Reset Brilliance");
     resetBrilliance->setParent(*grpBrl);
-    addAdvBool("brl_enable","Enable Brilliance",true,grpBrl);
-    addAdvD("brl","Brilliance",0.0,-6.0,2.0,grpBrl);
-    addAdvD("brl_r","Brilliance R",-2.5,-6.0,2.0,grpBrl);
-    addAdvD("brl_g","Brilliance G",-1.5,-6.0,2.0,grpBrl);
-    addAdvD("brl_b","Brilliance B",-1.5,-6.0,2.0,grpBrl);
-    addAdvD("brl_rng","Brilliance Range",0.5,0.0,1.0,grpBrl);
-    addAdvD("brl_st","Brilliance Strength",0.35,0.0,1.0,grpBrl);
-    addAdvBool("brlp_enable","Enable Post Brilliance",true,grpBrl);
-    addAdvD("brlp","Brilliance Post",-0.5,-1.0,0.0,grpBrl);
-    addAdvD("brlp_r","Post Brilliance R",-1.25,-3.0,0.0,grpBrl);
-    addAdvD("brlp_g","Post Brilliance G",-1.25,-3.0,0.0,grpBrl);
-    addAdvD("brlp_b","Post Brilliance B",-0.25,-3.0,0.0,grpBrl);
+    addAdvBool("brl_enable","Enable Brilliance",defaultParams.brl_enable != 0,grpBrl);
+    addAdvD("brl","Brilliance",defaultParams.brl,-6.0,2.0,grpBrl);
+    addAdvD("brl_r","Brilliance R",defaultParams.brl_r,-6.0,2.0,grpBrl);
+    addAdvD("brl_g","Brilliance G",defaultParams.brl_g,-6.0,2.0,grpBrl);
+    addAdvD("brl_b","Brilliance B",defaultParams.brl_b,-6.0,2.0,grpBrl);
+    addAdvD("brl_rng","Brilliance Range",defaultParams.brl_rng,0.0,1.0,grpBrl);
+    addAdvD("brl_st","Brilliance Strength",defaultParams.brl_st,0.0,1.0,grpBrl);
+    addAdvBool("brlp_enable","Enable Post Brilliance",defaultParams.brlp_enable != 0,grpBrl);
+    addAdvD("brlp","Brilliance Post",defaultParams.brlp,-1.0,0.0,grpBrl);
+    addAdvD("brlp_r","Post Brilliance R",defaultParams.brlp_r,-3.0,0.0,grpBrl);
+    addAdvD("brlp_g","Post Brilliance G",defaultParams.brlp_g,-3.0,0.0,grpBrl);
+    addAdvD("brlp_b","Post Brilliance B",defaultParams.brlp_b,-3.0,0.0,grpBrl);
 
     auto* resetHue = d.definePushButtonParam("reset_hue");
     resetHue->setLabel("Reset Hue");
     resetHue->setParent(*grpHue);
-    addAdvBool("hc_enable","Enable Hue Contrast",true,grpHue);
-    addAdvD("hc_r","Hue Contrast R",1.0,0.0,2.0,grpHue);
-    addAdvD("hc_r_rng","Hue Contrast R Range",0.3,0.0,1.0,grpHue);
-    addAdvBool("hs_rgb_enable","Enable Hueshift RGB",true,grpHue);
-    addAdvD("hs_r","Hueshift R",0.6,0.0,1.0,grpHue);
-    addAdvD("hs_g","Hueshift G",0.35,0.0,1.0,grpHue);
-    addAdvD("hs_b","Hueshift B",0.66,0.0,1.0,grpHue);
-    addAdvD("hs_r_rng","Hueshift R Range",0.6,0.0,2.0,grpHue);
-    addAdvD("hs_g_rng","Hueshift G Range",1.0,0.0,2.0,grpHue);
-    addAdvD("hs_b_rng","Hueshift B Range",1.0,0.0,4.0,grpHue);
-    addAdvBool("hs_cmy_enable","Enable Hueshift CMY",true,grpHue);
-    addAdvD("hs_c","Hueshift C",0.25,0.0,1.0,grpHue);
-    addAdvD("hs_m","Hueshift M",0.0,0.0,1.0,grpHue);
-    addAdvD("hs_y","Hueshift Y",0.0,0.0,1.0,grpHue);
-    addAdvD("hs_c_rng","Hueshift C Range",1.0,0.0,1.0,grpHue);
-    addAdvD("hs_m_rng","Hueshift M Range",1.0,0.0,1.0,grpHue);
-    addAdvD("hs_y_rng","Hueshift Y Range",1.0,0.0,1.0,grpHue);
+    addAdvBool("hc_enable","Enable Hue Contrast",defaultParams.hc_enable != 0,grpHue);
+    addAdvD("hc_r","Hue Contrast R",defaultParams.hc_r,0.0,2.0,grpHue);
+    addAdvD("hc_r_rng","Hue Contrast R Range",defaultParams.hc_r_rng,0.0,1.0,grpHue);
+    addAdvBool("hs_rgb_enable","Enable Hueshift RGB",defaultParams.hs_rgb_enable != 0,grpHue);
+    addAdvD("hs_r","Hueshift R",defaultParams.hs_r,0.0,1.0,grpHue);
+    addAdvD("hs_g","Hueshift G",defaultParams.hs_g,0.0,1.0,grpHue);
+    addAdvD("hs_b","Hueshift B",defaultParams.hs_b,0.0,1.0,grpHue);
+    addAdvD("hs_r_rng","Hueshift R Range",defaultParams.hs_r_rng,0.0,2.0,grpHue);
+    addAdvD("hs_g_rng","Hueshift G Range",defaultParams.hs_g_rng,0.0,2.0,grpHue);
+    addAdvD("hs_b_rng","Hueshift B Range",defaultParams.hs_b_rng,0.0,4.0,grpHue);
+    addAdvBool("hs_cmy_enable","Enable Hueshift CMY",defaultParams.hs_cmy_enable != 0,grpHue);
+    addAdvD("hs_c","Hueshift C",defaultParams.hs_c,0.0,1.0,grpHue);
+    addAdvD("hs_m","Hueshift M",defaultParams.hs_m,0.0,1.0,grpHue);
+    addAdvD("hs_y","Hueshift Y",defaultParams.hs_y,0.0,1.0,grpHue);
+    addAdvD("hs_c_rng","Hueshift C Range",defaultParams.hs_c_rng,0.0,1.0,grpHue);
+    addAdvD("hs_m_rng","Hueshift M Range",defaultParams.hs_m_rng,0.0,1.0,grpHue);
+    addAdvD("hs_y_rng","Hueshift Y Range",defaultParams.hs_y_rng,0.0,1.0,grpHue);
 
     auto* userPresetName = d.defineStringParam("userPresetName");
     userPresetName->setLabel("User Preset Name");
@@ -5669,6 +6054,21 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     auto* userPresetRefresh = d.definePushButtonParam("userPresetRefresh");
     userPresetRefresh->setLabel("Refresh Presets");
     userPresetRefresh->setParent(*grpUserPresetsRoot);
+
+    auto* grpUserPresetDefaults = d.defineGroupParam("grp_user_preset_defaults");
+    grpUserPresetDefaults->setLabel("Defaults");
+    grpUserPresetDefaults->setOpen(true);
+    grpUserPresetDefaults->setParent(*grpUserPresetsRoot);
+
+    auto* userPresetSaveDefault = d.definePushButtonParam("userPresetSaveDefault");
+    userPresetSaveDefault->setLabel("Save Default");
+    userPresetSaveDefault->setParent(*grpUserPresetDefaults);
+    if (const char* hint = tooltipForParam("userPresetSaveDefault")) userPresetSaveDefault->setHint(hint);
+
+    auto* userPresetResetDefault = d.definePushButtonParam("userPresetResetDefault");
+    userPresetResetDefault->setLabel("Reset Default");
+    userPresetResetDefault->setParent(*grpUserPresetDefaults);
+    if (const char* hint = tooltipForParam("userPresetResetDefault")) userPresetResetDefault->setHint(hint);
 
     auto* grpCubeViewer = d.defineGroupParam("grp_cube_viewer");
     grpCubeViewer->setLabel("Cube Viewer");
@@ -5766,7 +6166,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
     supportOfxVersion->setLabel("OFX version");
-    supportOfxVersion->setDefault("v1.2.11");
+    supportOfxVersion->setDefault("v1.2.12");
     supportOfxVersion->setEnabled(false);
     supportOfxVersion->setParent(*grpSupportRoot);
   }

@@ -2,7 +2,7 @@
 
 #include <cstddef>
 
-#include "../OpenDRTParams.h"
+#include "../../core/OpenDRTParams.h"
 
 namespace OpenDRTMetal {
 

@@ -38,7 +38,7 @@ jobs:
 
           printf '%s\n' "${changed_files}" > changed_files.txt
 
-          if grep -Eq '^(ME_OpenDRT/source/CMakeLists\.txt|ME_OpenDRT/source/cmake/|ME_OpenDRT/source/src/|ME_OpenDRT/source/tools/|ME_OpenDRT/OFX-Workshop/|\.github/workflows/build-me_opendrt-(all-platforms|linux|macos|macos-arm64-safe|windows)\.yml)' changed_files.txt; then
+          if grep -Eq '^(ME_OpenDRT/source/(CMakeLists\.txt|cmake/|core/|hosts/ofx/|ofx-sdk/|shared/|src/|tools/cube_viewer_stub/)|ME_OpenDRT/OFX-Workshop/icons/|\.github/workflows/build-me_opendrt-(all-platforms|linux|macos|macos-arm64-safe|windows)\.yml)' changed_files.txt; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           else
             echo "should_build=false" >> "$GITHUB_OUTPUT"
@@ -187,73 +187,43 @@ jobs:
 
       - name: Build draft release notes
         if: steps.draft_meta.outputs.skip_release != 'true'
-        env:
-          SHA: ${{ github.sha }}
-          ACTOR: ${{ github.actor }}
-          REF_NAME: ${{ github.ref_name }}
-          SERVER_URL: ${{ github.server_url }}
-          REPO: ${{ github.repository }}
-          PACKAGE_VERSION: ${{ steps.version.outputs.package_version }}
         run: |
           set -euo pipefail
 
-          short_sha="${SHA::7}"
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
+          cat > draft_release_notes.md <<'EOF'
+          <!-- Write public release notes anywhere outside the manager blocks. -->
 
-          source = Path("latest_release_body.txt")
-          target = Path("latest_release_body_sanitized.txt")
+          <!-- Manager highlights: add short manager-facing highlight text between these markers. -->
+          <!-- manager-highlights:start -->
+          <!-- manager-highlights:end -->
 
-          if not source.exists():
-              target.write_text("", encoding="utf-8")
-              raise SystemExit(0)
+          <!-- manager-available-stable: false -->
 
-          text = source.read_text(encoding="utf-8")
-          text = re.sub(
-              r"<!--\s*manager-highlights:start\s*-->.*?<!--\s*manager-highlights:end\s*-->",
-              "",
-              text,
-              flags=re.DOTALL | re.IGNORECASE,
-          )
-          text = re.sub(
-              r"(?im)^\s*manager-available-stable\s*:\s*true\s*$",
-              "",
-              text,
-          )
-          text = text.strip()
-          target.write_text(f"{text}\n" if text else "", encoding="utf-8")
-          PY
+          <!-- manager-diagnostics
           {
-            echo "Automated draft release for ME_OpenDRT."
-            echo
-            echo "- Version: ${PACKAGE_VERSION}"
-            echo "- Base release: ${LATEST_NAME} (${LATEST_TAG})"
-            echo "- Branch: ${REF_NAME}"
-            echo "- Commit: ${short_sha}"
-            echo "- Triggered by: ${ACTOR}"
-            echo "- Workflow run: ${SERVER_URL}/${REPO}/actions/runs/${{ github.run_id }}"
-            echo
-            if [ -s latest_release_body_sanitized.txt ]; then
-              echo "## Base Release Notes"
-              echo
-              cat latest_release_body_sanitized.txt
-              echo
-            fi
-            echo "## Manager Highlights"
-            echo
-            echo "Add short user-facing highlights between the markers before publishing."
-            echo
-            echo "<!-- manager-highlights:start -->"
-            echo "<!-- manager-highlights:end -->"
-            echo
-            echo "## Included Artifacts"
-            if [ -d artifacts ]; then
-              find artifacts -type f \( -name "*.zip" -o -name "*.tar.gz" \) -exec basename {} \; | sed 's/^/- /' | sort
-            else
-              echo "- No downloaded artifacts were found for this run."
-            fi
-          } > draft_release_notes.md
+            "enabled": false,
+            "logSourcePath": {
+              "windows": [
+                "%LOCALAPPDATA%\\ME_OpenDRT",
+                "%TEMP%\\ME_OpenDRT_CubeViewer.log"
+              ],
+              "macos": [
+                "~/Library/Logs/ME_OpenDRT.log",
+                "~/Library/Logs/ME_OpenDRT_CubeViewer.log"
+              ],
+              "linux": [
+                "~/.cache/ME_OpenDRT",
+                "~/.cache/ME_OpenDRT_CubeViewer.log"
+              ]
+            },
+            "environment": {
+              "ME_OPENDRT_DEBUG_LOG": "1",
+              "ME_OPENDRT_PERF_LOG": "1",
+              "ME_OPENDRT_VIEWER_DIAGNOSTICS": "1"
+            }
+          }
+          -->
+          EOF
 
       - name: Skip draft release because version is already published
         if: steps.draft_meta.outputs.skip_release == 'true'
@@ -278,8 +248,7 @@ jobs:
 
           if [ "${DRAFT_EXISTS}" = "true" ]; then
             gh release edit "${DRAFT_TAG}" \
-              --title "${DRAFT_TITLE}" \
-              --notes-file draft_release_notes.md
+              --title "${DRAFT_TITLE}"
             gh release upload "${DRAFT_TAG}" \
               --clobber \
               "${release_files[@]}"

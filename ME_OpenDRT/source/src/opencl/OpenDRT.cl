@@ -295,36 +295,36 @@ inline float3 display_gamut_whitepoint(float3 rgb, float tsn, float cwp_lm, int 
   return rgb;
 }
 
-inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, __constant OpenDRTParams* p, __constant OpenDRTDerivedParams* d) {
+inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, OpenDRTParams p, OpenDRTDerivedParams d) {
   // Mirrors CUDA transform implementation using resolved params from host.
   float3x3 in_to_xyz = identity();
-  if (p->in_gamut == 1) in_to_xyz = matrix_ap0_to_xyz;
-  else if (p->in_gamut == 2) in_to_xyz = matrix_ap1_to_xyz;
-  else if (p->in_gamut == 3) in_to_xyz = matrix_p3d65_to_xyz;
-  else if (p->in_gamut == 4) in_to_xyz = matrix_rec2020_to_xyz;
-  else if (p->in_gamut == 5) in_to_xyz = matrix_rec709_to_xyz;
-  else if (p->in_gamut == 6) in_to_xyz = matrix_arriwg3_to_xyz;
-  else if (p->in_gamut == 7) in_to_xyz = matrix_arriwg4_to_xyz;
-  else if (p->in_gamut == 8) in_to_xyz = matrix_redwg_to_xyz;
-  else if (p->in_gamut == 9) in_to_xyz = matrix_sonysgamut3_to_xyz;
-  else if (p->in_gamut == 10) in_to_xyz = matrix_sonysgamut3cine_to_xyz;
-  else if (p->in_gamut == 11) in_to_xyz = matrix_vgamut_to_xyz;
-  else if (p->in_gamut == 12) in_to_xyz = matrix_egamut_to_xyz;
-  else if (p->in_gamut == 13) in_to_xyz = matrix_egamut2_to_xyz;
-  else if (p->in_gamut == 14) in_to_xyz = matrix_davinciwg_to_xyz;
+  if (p.in_gamut == 1) in_to_xyz = matrix_ap0_to_xyz;
+  else if (p.in_gamut == 2) in_to_xyz = matrix_ap1_to_xyz;
+  else if (p.in_gamut == 3) in_to_xyz = matrix_p3d65_to_xyz;
+  else if (p.in_gamut == 4) in_to_xyz = matrix_rec2020_to_xyz;
+  else if (p.in_gamut == 5) in_to_xyz = matrix_rec709_to_xyz;
+  else if (p.in_gamut == 6) in_to_xyz = matrix_arriwg3_to_xyz;
+  else if (p.in_gamut == 7) in_to_xyz = matrix_arriwg4_to_xyz;
+  else if (p.in_gamut == 8) in_to_xyz = matrix_redwg_to_xyz;
+  else if (p.in_gamut == 9) in_to_xyz = matrix_sonysgamut3_to_xyz;
+  else if (p.in_gamut == 10) in_to_xyz = matrix_sonysgamut3cine_to_xyz;
+  else if (p.in_gamut == 11) in_to_xyz = matrix_vgamut_to_xyz;
+  else if (p.in_gamut == 12) in_to_xyz = matrix_egamut_to_xyz;
+  else if (p.in_gamut == 13) in_to_xyz = matrix_egamut2_to_xyz;
+  else if (p.in_gamut == 14) in_to_xyz = matrix_davinciwg_to_xyz;
 
   float crv_tsn = 0.0f;
   float2 pos = (float2)((float)x, (float)y), res = (float2)((float)width, (float)height);
-  if (p->crv_enable == 1) crv_tsn = oetf_filmlight_tlog(pos.x / res.x);
+  if (p.crv_enable == 1) crv_tsn = oetf_filmlight_tlog(pos.x / res.x);
 
-  rgb = linearize(rgb, p->in_oetf);
+  rgb = linearize(rgb, p.in_oetf);
   rgb = vdot(matrix_xyz_to_p3d65, vdot(in_to_xyz, rgb));
 
-  float3 rs_w = (float3)(p->rs_rw, 1.0f - p->rs_rw - p->rs_bw, p->rs_bw);
+  float3 rs_w = (float3)(p.rs_rw, 1.0f - p.rs_rw - p.rs_bw, p.rs_bw);
   float sat_L = dot(rgb, rs_w);
-  rgb = sat_L * p->rs_sa + rgb * (1.0f - p->rs_sa);
-  rgb += p->tn_off;
-  if (p->crv_enable == 1) crv_tsn += p->tn_off;
+  rgb = sat_L * p.rs_sa + rgb * (1.0f - p.rs_sa);
+  rgb += p.tn_off;
+  if (p.crv_enable == 1) crv_tsn += p.tn_off;
 
   float tsn = hypotf3(rgb) / 1.7320508075688772f;
   rgb = sdivf3f(rgb, tsn);
@@ -336,126 +336,126 @@ inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, 
   float3 ha_rgb_hs = (float3)(gauss_window(hue_offset(hue, -0.4f), 0.66f), ha_rgb.y, gauss_window(hue_offset(hue, 2.5f), 0.66f));
   float3 ha_cmy = (float3)(gauss_window(hue_offset(hue, 3.3f), 0.5f), gauss_window(hue_offset(hue, 1.3f), 0.5f), gauss_window(hue_offset(hue, -1.15f), 0.5f));
 
-  if (p->brl_enable) {
-    float brl_tsf = pow(tsn / (tsn + 1.0f), 1.0f - p->brl_rng);
-    float brl_exf = (p->brl + p->brl_r*ha_rgb.x + p->brl_g*ha_rgb.y + p->brl_b*ha_rgb.z) * pow(ach_d, 1.0f/p->brl_st);
+  if (p.brl_enable) {
+    float brl_tsf = pow(tsn / (tsn + 1.0f), 1.0f - p.brl_rng);
+    float brl_exf = (p.brl + p.brl_r*ha_rgb.x + p.brl_g*ha_rgb.y + p.brl_b*ha_rgb.z) * pow(ach_d, 1.0f/p.brl_st);
     float brl_ex = pow(2.0f, brl_exf * (brl_exf < 0.0f ? brl_tsf : 1.0f - brl_tsf));
     tsn *= brl_ex;
   }
 
-  if (p->tn_lcon_enable) {
-    float lcon_m = pow(2.0f, -p->tn_lcon), lcon_w = p->tn_lcon_w / 4.0f; lcon_w *= lcon_w;
-    float ts_x0 = 0.18f + p->tn_off;
+  if (p.tn_lcon_enable) {
+    float lcon_m = pow(2.0f, -p.tn_lcon), lcon_w = p.tn_lcon_w / 4.0f; lcon_w *= lcon_w;
+    float ts_x0 = 0.18f + p.tn_off;
     float lcon_cnst_sc = compress_toe_cubic(ts_x0, lcon_m, lcon_w, 1) / ts_x0;
     tsn = compress_toe_cubic(tsn * lcon_cnst_sc, lcon_m, lcon_w, 0);
-    if (p->crv_enable == 1) crv_tsn = compress_toe_cubic(crv_tsn * lcon_cnst_sc, lcon_m, lcon_w, 0);
+    if (p.crv_enable == 1) crv_tsn = compress_toe_cubic(crv_tsn * lcon_cnst_sc, lcon_m, lcon_w, 0);
   }
 
-  if (p->tn_hcon_enable) {
-    const float hcon_p = pow(2.0f, p->tn_hcon);
-    tsn = contrast_high(tsn, hcon_p, p->tn_hcon_pv, p->tn_hcon_st, 0);
-    if (p->crv_enable == 1) crv_tsn = contrast_high(crv_tsn, hcon_p, p->tn_hcon_pv, p->tn_hcon_st, 0);
+  if (p.tn_hcon_enable) {
+    const float hcon_p = pow(2.0f, p.tn_hcon);
+    tsn = contrast_high(tsn, hcon_p, p.tn_hcon_pv, p.tn_hcon_st, 0);
+    if (p.crv_enable == 1) crv_tsn = contrast_high(crv_tsn, hcon_p, p.tn_hcon_pv, p.tn_hcon_st, 0);
   }
 
   float ts_m2, ts_p, ts_s1, s_Lp100, ts_s;
-  if (d->enabled != 0) {
-    ts_m2 = d->ts_m2;
-    ts_p = d->ts_p;
-    ts_s1 = d->ts_s1;
-    s_Lp100 = d->s_Lp100;
-    ts_s = d->ts_s;
+  if (d.enabled != 0) {
+    ts_m2 = d.ts_m2;
+    ts_p = d.ts_p;
+    ts_s1 = d.ts_s1;
+    s_Lp100 = d.s_Lp100;
+    ts_s = d.ts_s;
   } else {
-    float ts_x1 = pow(2.0f, 6.0f * p->tn_sh + 4.0f), ts_y1 = p->tn_Lp / 100.0f, ts_x0 = 0.18f + p->tn_off;
-    float ts_y0 = p->tn_Lg / 100.0f * (1.0f + p->tn_gb * log2(ts_y1));
-    float ts_s0 = compress_toe_quadratic(ts_y0, p->tn_toe, 1);
-    ts_p = p->tn_con / (1.0f + (float)p->tn_su * 0.05f);
-    float ts_s10 = ts_x0 * (pow(ts_s0, -1.0f / p->tn_con) - 1.0f);
-    float ts_m1 = ts_y1 / pow(ts_x1 / (ts_x1 + ts_s10), p->tn_con);
-    ts_m2 = compress_toe_quadratic(ts_m1, p->tn_toe, 1);
-    ts_s = ts_x0 * (pow(ts_s0 / ts_m2, -1.0f / p->tn_con) - 1.0f);
-    s_Lp100 = ts_x0 * (pow((p->tn_Lg / 100.0f), -1.0f / p->tn_con) - 1.0f);
-    float pt_cmp_Lf = p->pt_hdr * fmin(1.0f, (p->tn_Lp - 100.0f) / 900.0f);
+    float ts_x1 = pow(2.0f, 6.0f * p.tn_sh + 4.0f), ts_y1 = p.tn_Lp / 100.0f, ts_x0 = 0.18f + p.tn_off;
+    float ts_y0 = p.tn_Lg / 100.0f * (1.0f + p.tn_gb * log2(ts_y1));
+    float ts_s0 = compress_toe_quadratic(ts_y0, p.tn_toe, 1);
+    ts_p = p.tn_con / (1.0f + (float)p.tn_su * 0.05f);
+    float ts_s10 = ts_x0 * (pow(ts_s0, -1.0f / p.tn_con) - 1.0f);
+    float ts_m1 = ts_y1 / pow(ts_x1 / (ts_x1 + ts_s10), p.tn_con);
+    ts_m2 = compress_toe_quadratic(ts_m1, p.tn_toe, 1);
+    ts_s = ts_x0 * (pow(ts_s0 / ts_m2, -1.0f / p.tn_con) - 1.0f);
+    s_Lp100 = ts_x0 * (pow((p.tn_Lg / 100.0f), -1.0f / p.tn_con) - 1.0f);
+    float pt_cmp_Lf = p.pt_hdr * fmin(1.0f, (p.tn_Lp - 100.0f) / 900.0f);
     ts_s1 = ts_s * pt_cmp_Lf + s_Lp100 * (1.0f - pt_cmp_Lf);
   }
   float tsn_pt = compress_hyperbolic_power(tsn, ts_s1, ts_p);
   float tsn_const = compress_hyperbolic_power(tsn, s_Lp100, ts_p);
   tsn = compress_hyperbolic_power(tsn, ts_s, ts_p);
   float crv_tsn_const = 0.0f;
-  if (p->crv_enable == 1) {
+  if (p.crv_enable == 1) {
     crv_tsn_const = compress_hyperbolic_power(crv_tsn, s_Lp100, ts_p);
     crv_tsn = compress_hyperbolic_power(crv_tsn, ts_s, ts_p);
   }
 
-  if (p->hc_enable) {
-    float hc_ts = pow(1.0f - tsn_const, 1.0f / p->hc_r_rng);
+  if (p.hc_enable) {
+    float hc_ts = pow(1.0f - tsn_const, 1.0f / p.hc_r_rng);
     float hc_c = ((1.0f - tsn_const) * (1.0f - ach_d) + ach_d * tsn_const) * ach_d * ha_rgb.x;
-    float hc_f = p->hc_r * (hc_c - 2.0f * hc_c * hc_ts) + 1.0f;
+    float hc_f = p.hc_r * (hc_c - 2.0f * hc_c * hc_ts) + 1.0f;
     rgb = (float3)(rgb.x, rgb.y * hc_f, rgb.z * hc_f);
   }
 
-  if (p->hs_rgb_enable) {
-    float3 hs_rgb = (float3)(ha_rgb_hs.x*ach_d*pow(tsn_pt,1.0f/p->hs_r_rng), ha_rgb_hs.y*ach_d*pow(tsn_pt,1.0f/p->hs_g_rng), ha_rgb_hs.z*ach_d*pow(tsn_pt,1.0f/p->hs_b_rng));
-    float3 hsf = (float3)(hs_rgb.x*p->hs_r, hs_rgb.y*-p->hs_g, hs_rgb.z*-p->hs_b);
+  if (p.hs_rgb_enable) {
+    float3 hs_rgb = (float3)(ha_rgb_hs.x*ach_d*pow(tsn_pt,1.0f/p.hs_r_rng), ha_rgb_hs.y*ach_d*pow(tsn_pt,1.0f/p.hs_g_rng), ha_rgb_hs.z*ach_d*pow(tsn_pt,1.0f/p.hs_b_rng));
+    float3 hsf = (float3)(hs_rgb.x*p.hs_r, hs_rgb.y*-p.hs_g, hs_rgb.z*-p.hs_b);
     hsf = (float3)(hsf.z - hsf.y, hsf.x - hsf.z, hsf.y - hsf.x);
     rgb += hsf;
   }
-  if (p->hs_cmy_enable) {
+  if (p.hs_cmy_enable) {
     float t = 1.0f - tsn_pt;
-    float3 hs_cmy = (float3)(ha_cmy.x*ach_d*pow(t,1.0f/p->hs_c_rng), ha_cmy.y*ach_d*pow(t,1.0f/p->hs_m_rng), ha_cmy.z*ach_d*pow(t,1.0f/p->hs_y_rng));
-    float3 hsf = (float3)(hs_cmy.x*-p->hs_c, hs_cmy.y*p->hs_m, hs_cmy.z*p->hs_y);
+    float3 hs_cmy = (float3)(ha_cmy.x*ach_d*pow(t,1.0f/p.hs_c_rng), ha_cmy.y*ach_d*pow(t,1.0f/p.hs_m_rng), ha_cmy.z*ach_d*pow(t,1.0f/p.hs_y_rng));
+    float3 hsf = (float3)(hs_cmy.x*-p.hs_c, hs_cmy.y*p.hs_m, hs_cmy.z*p.hs_y);
     hsf = (float3)(hsf.z - hsf.y, hsf.x - hsf.z, hsf.y - hsf.x);
     rgb += hsf;
   }
 
-  float pt_lml_p = 1.0f + 4.0f * (1.0f - tsn_pt) * (p->pt_lml + p->pt_lml_r*ha_rgb_hs.x + p->pt_lml_g*ha_rgb_hs.y + p->pt_lml_b*ha_rgb_hs.z);
+  float pt_lml_p = 1.0f + 4.0f * (1.0f - tsn_pt) * (p.pt_lml + p.pt_lml_r*ha_rgb_hs.x + p.pt_lml_g*ha_rgb_hs.y + p.pt_lml_b*ha_rgb_hs.z);
   float ptf = 1.0f;
-  if (p->pt_enable) {
+  if (p.pt_enable) {
     ptf = 1.0f - pow(tsn_pt, pt_lml_p);
-    float pt_lmh_p = (1.0f - ach_d * (p->pt_lmh_r * ha_rgb_hs.x + p->pt_lmh_b * ha_rgb_hs.z)) * (1.0f - p->pt_lmh * ach_d);
+    float pt_lmh_p = (1.0f - ach_d * (p.pt_lmh_r * ha_rgb_hs.x + p.pt_lmh_b * ha_rgb_hs.z)) * (1.0f - p.pt_lmh * ach_d);
     ptf = pow(fmax((float)1e-6f, ptf), pt_lmh_p);
   }
-  if (p->ptm_enable) {
-    float low = (p->ptm_low_st == 0.0f || p->ptm_low_rng == 0.0f) ? 1.0f : 1.0f + p->ptm_low * exp(-2.0f*ach_d*ach_d/p->ptm_low_st) * pow(1.0f - tsn_const, 1.0f/p->ptm_low_rng);
-    float high = (p->ptm_high_st == 0.0f || p->ptm_high_rng == 0.0f) ? 1.0f : 1.0f + p->ptm_high * exp(-2.0f*ach_d*ach_d/p->ptm_high_st) * pow(tsn_pt, 1.0f/(4.0f*p->ptm_high_rng));
+  if (p.ptm_enable) {
+    float low = (p.ptm_low_st == 0.0f || p.ptm_low_rng == 0.0f) ? 1.0f : 1.0f + p.ptm_low * exp(-2.0f*ach_d*ach_d/p.ptm_low_st) * pow(1.0f - tsn_const, 1.0f/p.ptm_low_rng);
+    float high = (p.ptm_high_st == 0.0f || p.ptm_high_rng == 0.0f) ? 1.0f : 1.0f + p.ptm_high * exp(-2.0f*ach_d*ach_d/p.ptm_high_st) * pow(tsn_pt, 1.0f/(4.0f*p.ptm_high_rng));
     ptf *= low * high;
   }
 
   rgb = rgb * ptf + 1.0f - ptf;
   sat_L = dot(rgb, rs_w);
-  float inv_rs_denom = p->rs_sa - 1.0f;
+  float inv_rs_denom = p.rs_sa - 1.0f;
   if (fabs(inv_rs_denom) < 1e-6f) inv_rs_denom = inv_rs_denom < 0.0f ? -1e-6f : 1e-6f;
-  rgb = (sat_L*p->rs_sa - rgb)/inv_rs_denom;
-  rgb = display_gamut_whitepoint(rgb, tsn_const, p->cwp_lm, p->display_gamut, p->cwp);
+  rgb = (sat_L*p.rs_sa - rgb)/inv_rs_denom;
+  rgb = display_gamut_whitepoint(rgb, tsn_const, p.cwp_lm, p.display_gamut, p.cwp);
 
-  if (p->brlp_enable) {
+  if (p.brlp_enable) {
     float2 bo = opponent(rgb);
     float ba = hypotf2(bo)/4.0f; ba = 1.1f*(ba*ba/(ba + 0.1f));
     float3 bhrgb = ach_d*ha_rgb;
-    float bm = p->brlp + p->brlp_r*bhrgb.x + p->brlp_g*bhrgb.y + p->brlp_b*bhrgb.z;
+    float bm = p.brlp + p.brlp_r*bhrgb.x + p.brlp_g*bhrgb.y + p.brlp_b*bhrgb.z;
     rgb *= pow(2.0f, bm*ba*tsn);
   }
-  if (p->ptl_enable) rgb = (float3)(softplus(rgb.x,p->ptl_c), softplus(rgb.y,p->ptl_m), softplus(rgb.z,p->ptl_y));
+  if (p.ptl_enable) rgb = (float3)(softplus(rgb.x,p.ptl_c), softplus(rgb.y,p.ptl_m), softplus(rgb.z,p.ptl_y));
 
-  tsn = compress_toe_quadratic(tsn * ts_m2, p->tn_toe, 0);
-  float ts_dsc = d->enabled != 0 ? d->ts_dsc : (p->eotf == 4 ? 0.01f : p->eotf == 5 ? 0.1f : 100.0f / p->tn_Lp);
+  tsn = compress_toe_quadratic(tsn * ts_m2, p.tn_toe, 0);
+  float ts_dsc = d.enabled != 0 ? d.ts_dsc : (p.eotf == 4 ? 0.01f : p.eotf == 5 ? 0.1f : 100.0f / p.tn_Lp);
   tsn *= ts_dsc;
-  if (p->crv_enable == 1) {
-    crv_tsn = compress_toe_quadratic(crv_tsn * ts_m2, p->tn_toe, 0) * ts_dsc;
-    if (p->eotf == 4) crv_tsn *= 10.0f;
+  if (p.crv_enable == 1) {
+    crv_tsn = compress_toe_quadratic(crv_tsn * ts_m2, p.tn_toe, 0) * ts_dsc;
+    if (p.eotf == 4) crv_tsn *= 10.0f;
   }
   float3 crv_rgb = (float3)(crv_tsn, crv_tsn, crv_tsn);
-  if (p->crv_enable == 1) crv_rgb = display_gamut_whitepoint(crv_rgb, crv_tsn_const, p->cwp_lm, p->display_gamut, p->cwp);
+  if (p.crv_enable == 1) crv_rgb = display_gamut_whitepoint(crv_rgb, crv_tsn_const, p.cwp_lm, p.display_gamut, p.cwp);
   rgb *= tsn;
-  if (p->display_gamut == 2) rgb = vdot(matrix_p3_to_rec2020, clampminf3(rgb, 0.0f));
-  if (p->clamp) rgb = clampf3(rgb, 0.0f, 1.0f);
-  float eotf_p = 2.0f + p->eotf*0.2f;
-  if (p->eotf > 0 && p->eotf < 4) rgb = spowf3(rgb, 1.0f/eotf_p);
-  else if (p->eotf == 4) rgb = eotf_pq(rgb, 1);
-  else if (p->eotf == 5) rgb = eotf_hlg(rgb, 1);
-  if (p->crv_enable == 1) {
-    if (p->eotf > 0 && p->eotf < 4) crv_rgb = spowf3(crv_rgb, 1.0f/eotf_p);
-    else if (p->eotf == 4) crv_rgb = eotf_pq(crv_rgb, 1);
-    else if (p->eotf == 5) crv_rgb = eotf_hlg(crv_rgb, 1);
+  if (p.display_gamut == 2) rgb = vdot(matrix_p3_to_rec2020, clampminf3(rgb, 0.0f));
+  if (p.clamp) rgb = clampf3(rgb, 0.0f, 1.0f);
+  float eotf_p = 2.0f + p.eotf*0.2f;
+  if (p.eotf > 0 && p.eotf < 4) rgb = spowf3(rgb, 1.0f/eotf_p);
+  else if (p.eotf == 4) rgb = eotf_pq(rgb, 1);
+  else if (p.eotf == 5) rgb = eotf_hlg(rgb, 1);
+  if (p.crv_enable == 1) {
+    if (p.eotf > 0 && p.eotf < 4) crv_rgb = spowf3(crv_rgb, 1.0f/eotf_p);
+    else if (p.eotf == 4) crv_rgb = eotf_pq(crv_rgb, 1);
+    else if (p.eotf == 5) crv_rgb = eotf_hlg(crv_rgb, 1);
     float3 crv_rgb_dst = (float3)(pos.y - crv_rgb.x * res.y, pos.y - crv_rgb.y * res.y, pos.y - crv_rgb.z * res.y);
     const float crv_w0 = 0.35f;
     crv_rgb_dst.x = exp(-crv_rgb_dst.x * crv_rgb_dst.x * crv_w0);
@@ -473,11 +473,33 @@ __kernel void OpenDRTKernel(__global const float* src, __global float* dst, int 
   if (x >= width || y >= height) return;
   int i = (y * width + x) * 4;
   float3 rgb = (float3)(src[i+0], src[i+1], src[i+2]);
-  rgb = openDRTTransform(width, height, x, y, rgb, p, d);
+  rgb = openDRTTransform(width, height, x, y, rgb, *p, *d);
   dst[i+0] = rgb.x;
   dst[i+1] = rgb.y;
   dst[i+2] = rgb.z;
   dst[i+3] = src[i+3];
+}
+
+__kernel void OpenDRTKernelPitched(
+    __global const float* src,
+    __global float* dst,
+    int width,
+    int height,
+    int srcPitchFloats,
+    int dstPitchFloats,
+    OpenDRTParams p,
+    OpenDRTDerivedParams d) {
+  int x = get_global_id(0);
+  int y = get_global_id(1);
+  if (x >= width || y >= height) return;
+  int srcIndex = y * srcPitchFloats + x * 4;
+  int dstIndex = y * dstPitchFloats + x * 4;
+  float3 rgb = (float3)(src[srcIndex + 0], src[srcIndex + 1], src[srcIndex + 2]);
+  rgb = openDRTTransform(width, height, x, y, rgb, p, d);
+  dst[dstIndex + 0] = rgb.x;
+  dst[dstIndex + 1] = rgb.y;
+  dst[dstIndex + 2] = rgb.z;
+  dst[dstIndex + 3] = src[srcIndex + 3];
 }
 
 
