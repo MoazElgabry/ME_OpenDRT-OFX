@@ -147,41 +147,28 @@ jobs:
           fi
 
           short_sha="${SHA::7}"
-          draft_tag="me-opendrt-draft-v${PACKAGE_VERSION}"
-          draft_title="${latest_name} draft (${REF_NAME} ${short_sha})"
-          final_tag="v${PACKAGE_VERSION}"
+          draft_tag="v${PACKAGE_VERSION}"
+          draft_title="ME_OpenDRT v${PACKAGE_VERSION} draft (${REF_NAME} ${short_sha})"
+          final_tag="${draft_tag}"
 
-          if existing_draft_json="$(gh api "repos/${REPO}/releases/tags/${draft_tag}" 2>/dev/null)"; then
+          if existing_release_json="$(gh api "repos/${REPO}/releases/tags/${draft_tag}" 2>/dev/null)"; then
             :
           else
-            existing_draft_json=""
-          fi
-          if final_release_json="$(gh api "repos/${REPO}/releases/tags/${final_tag}" 2>/dev/null)"; then
-            :
-          else
-            final_release_json=""
+            existing_release_json=""
           fi
 
           draft_exists="false"
           skip_release="false"
           skip_reason=""
 
-          if [ -n "${existing_draft_json}" ]; then
-            is_draft="$(printf '%s' "${existing_draft_json}" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('draft', False)).lower())")"
+          if [ -n "${existing_release_json}" ]; then
+            is_draft="$(printf '%s' "${existing_release_json}" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('draft', False)).lower())")"
             if [ "${is_draft}" = "true" ]; then
               draft_exists="true"
             else
               echo "Release tag ${draft_tag} already exists and is not a draft; skipping draft release."
               skip_release="true"
               skip_reason="Published release already exists for ${draft_tag}."
-            fi
-          fi
-
-          if [ -n "${final_release_json}" ]; then
-            final_is_draft="$(printf '%s' "${final_release_json}" | python3 -c "import json,sys; print(str(json.load(sys.stdin).get('draft', False)).lower())")"
-            if [ "${final_is_draft}" != "true" ]; then
-              skip_release="true"
-              skip_reason="Published release already exists for ${final_tag}."
             fi
           fi
 
