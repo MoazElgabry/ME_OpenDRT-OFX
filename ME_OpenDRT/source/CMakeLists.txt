@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(ME_OpenDRT VERSION 1.2.12 LANGUAGES CXX)
-set(OPENDRT_DISPLAY_VERSION "1.2.12")
+project(ME_OpenDRT VERSION 1.2.13 LANGUAGES CXX)
+set(OPENDRT_DISPLAY_VERSION "1.2.13")
 
 set(PLUGIN_BASENAME "ME_OpenDRT")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.me_opendrt")
@@ -14,6 +14,7 @@ set(VIEWER_ICON_PNG "${SHARED_ICON_DIR}/Cube 2.png")
 set(GENERATED_ASSET_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 option(ME_OPENDRT_LINUX_CUDA "Enable CUDA backend on Linux builds" ON)
 option(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB "Build cube-viewer transport stub (research)" ON)
+option(ME_OPENDRT_BUILD_ADOBE_HOST "Build the Adobe/Premiere host target" OFF)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,6 +23,10 @@ set(ME_OPENDRT_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/core")
 set(ME_OPENDRT_OFX_HOST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/hosts/ofx")
 set(ME_OPENDRT_SHARED_VIEWER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shared/viewer")
 set(ME_OPENDRT_BACKEND_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+if(ME_OPENDRT_BUILD_ADOBE_HOST)
+add_subdirectory(hosts/adobe)
+endif()
 
 set(OFX_SUPPORT_SOURCES
   ofx-sdk/Support/Library/ofxsCore.cpp
@@ -36,6 +41,7 @@ set(OFX_SUPPORT_SOURCES
 
 set(PLUGIN_SOURCES
   hosts/ofx/OpenDRTOFXPlugin.cpp
+  core/OpenDRTLutExporter.cpp
   ${OFX_SUPPORT_SOURCES}
 )
 

@@ -185,7 +185,7 @@ std::string pointDrawSourceLabel(bool useComputeIdentityBuffers,
   return "none";
 }
 
-const char* kViewerVersionString = "v1.2.12";
+const char* kViewerVersionString = "v1.2.13";
 
 #if defined(_WIN32)
 void applyWindowsWindowIcon(GLFWwindow* window) {

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <algorithm>
 #if !defined(__linux__)
 #include <filesystem>
@@ -48,6 +49,7 @@ extern char** environ;
 #include "OpenDRTParams.h"
 #include "OpenDRTPresets.h"
 #include "OpenDRTProcessor.h"
+#include "OpenDRTLutExporter.h"
 
 #define kPluginName "ME_OpenDRT"
 #define kPluginGrouping "Moaz Elgabry"
@@ -924,6 +926,20 @@ std::string pickSaveJsonFilePath(const std::string& defaultName) {
   return std::string();
 }
 
+std::string pickSaveCubeFilePath(const std::string& defaultName) {
+  char filePath[MAX_PATH] = {0};
+  std::snprintf(filePath, MAX_PATH, "%s", defaultName.c_str());
+  OPENFILENAMEA ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.lpstrFilter = "CUBE LUT Files (*.cube)\0*.cube\0All Files (*.*)\0*.*\0";
+  ofn.lpstrFile = filePath;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+  ofn.lpstrDefExt = "cube";
+  if (GetSaveFileNameA(&ofn) == TRUE) return std::string(filePath);
+  return std::string();
+}
+
 bool confirmOverwriteDialog(const std::string& presetName) {
   std::string msg = "Preset '" + presetName + "' already exists. Overwrite?";
   return MessageBoxA(nullptr, msg.c_str(), "ME_OpenDRT", MB_ICONQUESTION | MB_YESNO) == IDYES;
@@ -973,6 +989,11 @@ std::string pickOpenJsonFilePath() {
 
 std::string pickSaveJsonFilePath(const std::string& defaultName) {
   std::string cmd = "osascript -e 'POSIX path of (choose file name with prompt \"Export ME_OpenDRT preset\" default name \"" + defaultName + "\")' 2>/dev/null";
+  return execAndRead(cmd);
+}
+
+std::string pickSaveCubeFilePath(const std::string& defaultName) {
+  std::string cmd = "osascript -e 'POSIX path of (choose file name with prompt \"Export ME_OpenDRT LUT\" default name \"" + defaultName + "\")' 2>/dev/null";
   return execAndRead(cmd);
 }
 
@@ -1054,6 +1075,24 @@ std::string pickSaveJsonFilePath(const std::string& defaultName) {
     std::string safe = defaultName;
     for (char& c : safe) if (c == '"') c = '\'';
     std::string cmd = "kdialog --getsavefilename \"$HOME/" + safe + "\" \"*.json|JSON Files\" 2>/dev/null";
+    return execAndReadLinux(cmd);
+  }
+  return std::string();
+}
+
+std::string pickSaveCubeFilePath(const std::string& defaultName) {
+  if (linuxCommandExists("zenity")) {
+    std::string safe = defaultName;
+    for (char& c : safe) if (c == '"') c = '\'';
+    std::string cmd =
+        "zenity --file-selection --save --confirm-overwrite --title=\"Export ME_OpenDRT LUT\" --file-filter=\"*.cube\" --filename=\"$HOME/" +
+        safe + "\" 2>/dev/null";
+    return execAndReadLinux(cmd);
+  }
+  if (linuxCommandExists("kdialog")) {
+    std::string safe = defaultName;
+    for (char& c : safe) if (c == '"') c = '\'';
+    std::string cmd = "kdialog --getsavefilename \"$HOME/" + safe + "\" \"*.cube|CUBE LUT Files\" 2>/dev/null";
     return execAndReadLinux(cmd);
   }
   return std::string();
@@ -1161,6 +1200,18 @@ bool openExternalUrl(const std::string& url) {
   return std::system(cmd.c_str()) == 0;
 }
 #endif
+
+std::string ensureCubeExtension(std::string path) {
+  const std::size_t slash = path.find_last_of("/\\");
+  const std::size_t dot = path.find_last_of('.');
+  if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) {
+    return path + ".cube";
+  }
+  std::string ext = path.substr(dot);
+  for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  if (ext == ".cube") return path;
+  return path + ".cube";
+}
 
 // ===== Preset Payload Codec: compact canonical payload (schema anchor) =====
 // Compact payload serialization keeps files small and load fast.
@@ -1706,11 +1757,14 @@ void saveUserPresetStoreLocked() {
   const auto path = userPresetFilePathV2();
 #if defined(__linux__)
   (void)ensureDirectoryExists(parentPath(path));
+  const auto tempPath = path + ".tmp";
 #else
   std::error_code ec;
   std::filesystem::create_directories(path.parent_path(), ec);
+  auto tempPath = path;
+  tempPath += ".tmp";
 #endif
-  std::ofstream os(path, std::ios::binary | std::ios::trunc);
+  std::ofstream os(tempPath, std::ios::binary | std::ios::trunc);
   if (!os.is_open()) return;
 
   UserPresetStore& s = userPresetStore();
@@ -1772,6 +1826,24 @@ void saveUserPresetStoreLocked() {
   }
   os << "  ]\n";
   os << "}\n";
+  os.close();
+  if (!os) return;
+
+#if defined(_WIN32)
+  (void)MoveFileExA(tempPath.string().c_str(), path.string().c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+#elif defined(__linux__)
+  if (std::rename(tempPath.c_str(), path.c_str()) != 0) {
+    std::remove(tempPath.c_str());
+  }
+#else
+  std::error_code renameEc;
+  std::filesystem::rename(tempPath, path, renameEc);
+  if (renameEc) {
+    std::filesystem::remove(path, renameEc);
+    renameEc.clear();
+    std::filesystem::rename(tempPath, path, renameEc);
+  }
+#endif
 }
 
 // One-time compatibility migration from legacy v1 format when v2 does not exist.
@@ -2287,6 +2359,9 @@ const char* tooltipForParam(const std::string& name) {
     {"cubeViewerShowOverflow", "Allow the viewer plot to extend outside the nominal cube bounds instead of clamping transformed values back into range."},
     {"cubeViewerHighlightOverflow", "Highlight out-of-bound plotted points in pure red while overflow display is enabled."},
     {"cubeViewerStatus", "Connection state for external 3D identity-cube viewer."},
+    {"lutExportFormat", "Choose the LUT interchange profile. Camera-specific entries export compatible .cube files for vendor tools."},
+    {"lutExportResolution", "3D LUT lattice size. Available values change to match the selected profile."},
+    {"lutExportButton", "Export the current effective OpenDRT transform as a sampled 3D .cube LUT."},
     {"userPresetSaveDefault", "Save the current startup defaults for new OpenDRT instances after the next plugin or host restart."},
     {"userPresetResetDefault", "Restore the factory startup defaults for new OpenDRT instances after the next plugin or host restart."}
   };
@@ -2303,6 +2378,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     srcClip_ = fetchClip(kOfxImageEffectSimpleSourceClipName);
     suppressParamChanged_ = true;
     syncPresetMenusFromDisk(0.0, getChoice("lookPreset", 0.0, 0), getChoice("tonescalePreset", 0.0, 0));
+    syncLutExportResolutionMenu(0.0, lutResolutionForSelection(getChoice("lutExportFormat", 0.0, 0), getChoice("lutExportResolution", 0.0, 1)));
     suppressParamChanged_ = false;
     updateToggleVisibility(0.0);
     syncCubeViewerOverflowUi(0.0);
@@ -3146,6 +3222,18 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         updateReadonlyDisplayLabels(args.time);
         updatePresetStateFromCurrent(args.time);
         pushCubeViewerUpdate(args.time, paramName, true);
+        return;
+      }
+
+      if (paramName == "lutExportFormat") {
+        const int previousResolution =
+            lutResolutionForSelection(lutExportFormatCache_, getChoice("lutExportResolution", args.time, 1));
+        syncLutExportResolutionMenu(args.time, previousResolution);
+        return;
+      }
+
+      if (paramName == "lutExportButton") {
+        (void)exportCurrentLut(args.time);
         return;
       }
 
@@ -4456,6 +4544,110 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     updateReadonlyDisplayLabels(t);
   }
 
+  OpenDRTLut::FormatProfile lutFormatProfileFromIndex(int formatIndex) const {
+    if (formatIndex == 1) return OpenDRTLut::FormatProfile::SonyCameraCube;
+    if (formatIndex == 2) return OpenDRTLut::FormatProfile::ArriColorToolCube;
+    return OpenDRTLut::FormatProfile::GenericCube;
+  }
+
+  std::vector<int> lutResolutionsForFormat(int formatIndex) const {
+    const auto profile = lutFormatProfileFromIndex(formatIndex);
+    if (profile == OpenDRTLut::FormatProfile::SonyCameraCube) return {17, 33};
+    if (profile == OpenDRTLut::FormatProfile::ArriColorToolCube) return {33};
+    return {17, 33, 65};
+  }
+
+  int lutResolutionForSelection(int formatIndex, int selectionIndex) const {
+    const std::vector<int> values = lutResolutionsForFormat(formatIndex);
+    if (values.empty()) return 33;
+    if (selectionIndex < 0 || selectionIndex >= static_cast<int>(values.size())) {
+      return OpenDRTLut::defaultResolution(lutFormatProfileFromIndex(formatIndex));
+    }
+    return values[static_cast<size_t>(selectionIndex)];
+  }
+
+  void syncLutExportResolutionMenu(double t, int preferredResolution) {
+    const int formatIndex = std::clamp(getChoice("lutExportFormat", t, 0), 0, 2);
+    const std::vector<int> values = lutResolutionsForFormat(formatIndex);
+    auto* p = fetchChoiceParam("lutExportResolution");
+    if (!p || values.empty()) return;
+    p->resetOptions();
+    int selectedIndex = -1;
+    for (int i = 0; i < static_cast<int>(values.size()); ++i) {
+      p->appendOption(std::to_string(values[static_cast<size_t>(i)]));
+      if (values[static_cast<size_t>(i)] == preferredResolution) selectedIndex = i;
+    }
+    if (selectedIndex < 0) {
+      const int def = OpenDRTLut::defaultResolution(lutFormatProfileFromIndex(formatIndex));
+      for (int i = 0; i < static_cast<int>(values.size()); ++i) {
+        if (values[static_cast<size_t>(i)] == def) selectedIndex = i;
+      }
+    }
+    p->setValue(selectedIndex < 0 ? 0 : selectedIndex);
+    lutExportFormatCache_ = formatIndex;
+  }
+
+  bool exportCurrentLut(double time) {
+    const int formatIndex = std::clamp(getChoice("lutExportFormat", time, 0), 0, 2);
+    const auto profile = lutFormatProfileFromIndex(formatIndex);
+    const int resolution = lutResolutionForSelection(formatIndex, getChoice("lutExportResolution", time, 1));
+    if (!OpenDRTLut::isSupportedResolution(profile, resolution)) {
+      syncLutExportResolutionMenu(time, OpenDRTLut::defaultResolution(profile));
+      return false;
+    }
+
+    std::string defaultName = "ME_OpenDRT_" + std::to_string(resolution) + ".cube";
+    std::string path = pickSaveCubeFilePath(defaultName);
+    if (path.empty()) return false;
+    path = ensureCubeExtension(path);
+
+    const bool overlayWasEnabled = getBool("crv_enable", time, 0) != 0;
+    if (overlayWasEnabled) {
+      FlagScope scope(suppressParamChanged_);
+      setBool("crv_enable", 0);
+    }
+
+    OpenDRTLut::ExportResult result{};
+    try {
+      OpenDRTRawValues raw = readRawValues(time);
+      raw.crv_enable = 0;
+      OpenDRTParams params = resolveParams(raw);
+      OpenDRTLut::ExportOptions options{};
+      options.profile = profile;
+      options.resolution = resolution;
+      options.title = "ME_OpenDRT " + std::to_string(resolution) + " " + OpenDRTLut::profileLabel(profile);
+      if (overlayWasEnabled) {
+        options.comment = "Tonescale Overlay was disabled during export because spatial overlays cannot be baked into a 3D LUT.";
+      }
+      result = OpenDRTLut::writeCubeFile(path, params, options);
+    } catch (const std::exception& e) {
+      result.ok = false;
+      result.error = e.what();
+    } catch (...) {
+      result.ok = false;
+      result.error = "Unknown LUT export error.";
+    }
+
+    if (overlayWasEnabled) {
+      FlagScope scope(suppressParamChanged_);
+      setBool("crv_enable", 1);
+      updatePresetStateFromCurrent(time);
+      pushCubeViewerUpdate(time, "crv_enable", true);
+    }
+
+    if (!result.ok) {
+      showInfoDialog("ME_OpenDRT LUT export failed.\n\n" + result.error);
+      return false;
+    }
+
+    std::string message = "ME_OpenDRT LUT export successful.\n\n" + path;
+    if (overlayWasEnabled) {
+      message += "\n\nTonescale Overlay was temporarily disabled during export because spatial overlays cannot be baked into a 3D LUT, then restored.";
+    }
+    showInfoDialog(message);
+    return true;
+  }
+
   // ===== Preset Manager Button Enable Rules =====
   // Manager actions are enabled only when current look or tonescale points to a user preset.
   // Export buttons are always enabled; they export current effective values.
@@ -5731,6 +5923,7 @@ void closeCubeViewerSession() {
   bool menuLabelToneModified_ = false;
   bool menuLabelCwpModified_ = false;
   bool menuLabelDisplayModified_ = false;
+  int lutExportFormatCache_ = 0;
   bool cubeViewerRequested_ = false;
   bool cubeViewerConnected_ = false;
   uint32_t cubeViewerProcessId_ = 0;
@@ -5785,7 +5978,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   // ===== Plugin Descriptor =====
   // Host capability advertisement and static metadata.
   void describe(OFX::ImageEffectDescriptor& d) override {
-static const std::string nameWithVersion = "ME_OpenDRT v1.2.12";
+static const std::string nameWithVersion = "ME_OpenDRT v1.2.13";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -6141,6 +6334,33 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     cubeViewerPlotLinear->setDefault(false);
     if (const char* hint = tooltipForParam("cubeViewerPlotInLinear")) cubeViewerPlotLinear->setHint(hint);
 
+    auto* grpLutExport = d.defineGroupParam("grp_lut_export");
+    grpLutExport->setLabel("LUT Export");
+    grpLutExport->setOpen(false);
+
+    auto* lutExportFormat = d.defineChoiceParam("lutExportFormat");
+    lutExportFormat->setLabel("LUT Format");
+    lutExportFormat->appendOption("CUBE (.cube)");
+    lutExportFormat->appendOption("Sony Camera CUBE (.cube)");
+    lutExportFormat->appendOption("ARRI Color Tool CUBE (.cube)");
+    lutExportFormat->setDefault(0);
+    lutExportFormat->setParent(*grpLutExport);
+    if (const char* hint = tooltipForParam("lutExportFormat")) lutExportFormat->setHint(hint);
+
+    auto* lutExportResolution = d.defineChoiceParam("lutExportResolution");
+    lutExportResolution->setLabel("LUT Resolution");
+    lutExportResolution->appendOption("17");
+    lutExportResolution->appendOption("33");
+    lutExportResolution->appendOption("65");
+    lutExportResolution->setDefault(1);
+    lutExportResolution->setParent(*grpLutExport);
+    if (const char* hint = tooltipForParam("lutExportResolution")) lutExportResolution->setHint(hint);
+
+    auto* lutExportButton = d.definePushButtonParam("lutExportButton");
+    lutExportButton->setLabel("Export LUT...");
+    lutExportButton->setParent(*grpLutExport);
+    if (const char* hint = tooltipForParam("lutExportButton")) lutExportButton->setHint(hint);
+
     auto* grpSupportRoot = d.defineGroupParam("grp_support_root");
     grpSupportRoot->setLabel("Support");
     grpSupportRoot->setOpen(false);
@@ -6166,7 +6386,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
     supportOfxVersion->setLabel("OFX version");
-    supportOfxVersion->setDefault("v1.2.12");
+    supportOfxVersion->setDefault("v1.2.13");
     supportOfxVersion->setEnabled(false);
     supportOfxVersion->setParent(*grpSupportRoot);
   }
