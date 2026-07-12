@@ -71,17 +71,52 @@ jobs:
           set -euo pipefail
           pr_number="${{ steps.create_pr.outputs.pull-request-number }}"
           repo="MoazElgabry/Moaz-Elgabry-plugins"
-          merge_state="$(gh pr view "${pr_number}" --repo "${repo}" --json mergeStateStatus --jq .mergeStateStatus)"
+          pr_url="$(gh pr view "${pr_number}" --repo "${repo}" --json url --jq .url)"
 
-          if [ "${merge_state}" = "CLEAN" ] || [ "${merge_state}" = "HAS_HOOKS" ]; then
-            gh pr merge "${pr_number}" \
-              --repo "${repo}" \
-              --squash \
-              --delete-branch
-          else
-            gh pr merge "${pr_number}" \
-              --repo "${repo}" \
-              --auto \
-              --squash \
-              --delete-branch
+          # A newly-created PR commonly reports UNKNOWN briefly while GitHub
+          # calculates mergeability. Do not mistake that transient state for
+          # a branch-policy requirement.
+          mergeable="UNKNOWN"
+          merge_state="UNKNOWN"
+          for attempt in $(seq 1 12); do
+            pr_state="$(gh pr view "${pr_number}" --repo "${repo}" \
+              --json mergeable,mergeStateStatus \
+              --jq '[.mergeable, .mergeStateStatus] | @tsv')"
+            IFS=$'\t' read -r mergeable merge_state <<< "${pr_state}"
+            echo "Mergeability attempt ${attempt}: mergeable=${mergeable}, state=${merge_state}"
+
+            if [ "${mergeable}" != "UNKNOWN" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          if [ "${mergeable}" = "UNKNOWN" ]; then
+            echo "::error::GitHub did not resolve PR mergeability in time: ${pr_url}"
+            exit 1
+          fi
+
+          if [ "${mergeable}" = "CONFLICTING" ] || [ "${merge_state}" = "DIRTY" ]; then
+            echo "::error::Manager manifest PR has merge conflicts: ${pr_url}"
+            exit 1
+          fi
+
+          # Direct merge is correct for repositories without protected-branch
+          # requirements. If branch policy blocks it, auto-merge is the
+          # appropriate fallback and GitHub will merge only after requirements pass.
+          if ! gh pr merge "${pr_number}" --repo "${repo}" --squash --delete-branch; then
+            echo "Direct merge was blocked; attempting protected-branch auto-merge."
+            if ! gh pr merge "${pr_number}" --repo "${repo}" --auto --squash --delete-branch; then
+              echo "::error::Neither direct merge nor auto-merge was accepted: ${pr_url}"
+              exit 1
+            fi
+          fi
+
+          final_state="$(gh pr view "${pr_number}" --repo "${repo}" --json state,autoMergeRequest \
+            --jq 'if .state == "MERGED" then "merged" elif .autoMergeRequest != null then "auto-merge-enabled" else .state end')"
+          echo "Manager manifest PR result: ${final_state} (${pr_url})"
+
+          if [ "${final_state}" != "merged" ] && [ "${final_state}" != "auto-merge-enabled" ]; then
+            echo "::error::Manager manifest PR was left in an unexpected state: ${final_state} (${pr_url})"
+            exit 1
           fi
