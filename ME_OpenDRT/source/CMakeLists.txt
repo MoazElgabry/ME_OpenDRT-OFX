@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(ME_OpenDRT VERSION 1.2.13 LANGUAGES CXX)
-set(OPENDRT_DISPLAY_VERSION "1.2.13")
+project(ME_OpenDRT VERSION 1.2.14 LANGUAGES CXX)
+set(OPENDRT_DISPLAY_VERSION "1.2.14")
 
 set(PLUGIN_BASENAME "ME_OpenDRT")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.me_opendrt")

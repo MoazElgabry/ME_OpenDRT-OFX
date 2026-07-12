@@ -33,3 +33,5 @@ MoazElgabryPluginManager/node_modules/
 MoazElgabryPluginManager/dist/
 MoazElgabryPluginManager/src-tauri/target/
 MoazElgabryPluginManager/src-tauri/gen/
+ME_OpenDRT/source/sign_release.ps1
+ME_OpenDRT/source/sign_release.ps1

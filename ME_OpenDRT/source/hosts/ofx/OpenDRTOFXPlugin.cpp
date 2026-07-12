@@ -2387,9 +2387,20 @@ class OpenDRTEffect : public OFX::ImageEffect {
     cubeViewerLive_ = getBool("cubeViewerLive", 0.0, 1) != 0;
     cubeViewerQuality_ = getChoice("cubeViewerQuality", 0.0, 0);
     setBool("cubeViewerIdentity", getChoice("cubeViewerSource", 0.0, 0) == 0 ? 1 : 0);
+    // Materialize the immutable sender ID before any worker or render thread can
+    // request it. This avoids lazy string mutation across concurrent callbacks.
+    (void)cubeViewerSenderId();
     setCubeViewerStatusLabel("Disconnected");
-    startCubeViewerStatusMonitor();
-    startCubeViewerIoWorker();
+    try {
+      startCubeViewerStatusMonitor();
+      startCubeViewerIoWorker();
+    } catch (...) {
+      // A partially constructed effect does not run its class destructor.
+      // Join any worker that did start before propagating construction failure.
+      stopCubeViewerIoWorker();
+      stopCubeViewerStatusMonitor();
+      throw;
+    }
   }
 
   ~OpenDRTEffect() override {
@@ -2415,9 +2426,12 @@ class OpenDRTEffect : public OFX::ImageEffect {
   // Rule: keep preset/file management out of this path for predictable playback.
   // Render stage map: (1) validate clips/layout, (2) resolve params, (3) pick backend, (4) optional viewer cloud publish.
 void render(const OFX::RenderArguments& args) override {
+    // OFX declares this effect instance-safe: hosts may render different
+    // instances concurrently, but a single instance owns reusable processor,
+    // staging, and viewer-cache state. Defend against hosts that issue
+    // overlapping actions for one instance rather than allowing memory reuse.
+    std::lock_guard<std::mutex> renderLock(renderMutex_);
     const auto tRenderStart = std::chrono::steady_clock::now();
-    updateToggleVisibility(args.time);
-    syncCubeViewerOverflowUi(args.time);
     refreshCubeViewerRuntimeStateRenderSafe();
     std::unique_ptr<OFX::Image> src(srcClip_->fetchImage(args.time));
     std::unique_ptr<OFX::Image> dst(dstClip_->fetchImage(args.time));
@@ -2431,12 +2445,35 @@ void render(const OFX::RenderArguments& args) override {
       OFX::throwSuiteStatusException(kOfxStatErrUnsupported);
     }
 
-    const OfxRectI bounds = dst->getBounds();
+    const OfxRectI srcBounds = src->getBounds();
+    const OfxRectI dstBounds = dst->getBounds();
+    const auto intersectRect = [](const OfxRectI& a, const OfxRectI& b) {
+      return OfxRectI{
+          std::max(a.x1, b.x1),
+          std::max(a.y1, b.y1),
+          std::min(a.x2, b.x2),
+          std::min(a.y2, b.y2)};
+    };
+    const auto sameRect = [](const OfxRectI& a, const OfxRectI& b) {
+      return a.x1 == b.x1 && a.y1 == b.y1 && a.x2 == b.x2 && a.y2 == b.y2;
+    };
+
+    // The render window is the only region the host authorizes us to write.
+    // Source and destination images retain independent bounds and origins.
+    const OfxRectI bounds = intersectRect(args.renderWindow, dstBounds);
     const int width = bounds.x2 - bounds.x1;
     const int height = bounds.y2 - bounds.y1;
     if (width <= 0 || height <= 0) {
       return;
     }
+    const OfxRectI readableBounds = intersectRect(bounds, srcBounds);
+    if (!sameRect(readableBounds, bounds)) {
+      if (debugLogEnabled()) {
+        std::fprintf(stderr, "[ME_OpenDRT] Source does not cover requested render window.\n");
+      }
+      OFX::throwSuiteStatusException(kOfxStatFailed);
+    }
+    const bool fullFrameHostGpuLayout = sameRect(bounds, dstBounds) && sameRect(srcBounds, dstBounds);
 
     const size_t rowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
     struct RowLayout {
@@ -2484,7 +2521,7 @@ void render(const OFX::RenderArguments& args) override {
     perfLog("Param resolve", tResolveStart);
     const bool canUpdateInputCloudCache =
         cubeViewerRequested_ && cubeViewerLive_ &&
-        isFullFrameRenderWindow(bounds, args.renderWindow) &&
+        sameRect(bounds, dstBounds) && isFullFrameRenderWindow(dstBounds, args.renderWindow) &&
         isHighQualityRenderForCloud(args);
     const bool needFirstCloudHandoff = shouldEmitCubeViewerInputCloudFirstHandoff(args.time);
     const bool needSteadyStateCloud = canUpdateInputCloudCache && shouldEmitCubeViewerInputCloudSteadyState(args.time);
@@ -2513,13 +2550,22 @@ void render(const OFX::RenderArguments& args) override {
     const bool preferHostCuda = (selectedCudaRenderMode() == CudaRenderMode::HostPreferred);
     const bool tryHostCuda = preferHostCuda && args.isEnabledCudaRender && (args.pCudaStream != nullptr);
     if (tryHostCuda) {
+      // Host GPU buffer base-pointer semantics are only unambiguous for the
+      // complete image advertised by this non-tiled effect. Never guess an
+      // offset into a device allocation for a cropped or mismatched image.
+      if (!fullFrameHostGpuLayout) {
+        OFX::throwSuiteStatusException(kOfxStatErrUnsupported);
+      }
       const auto tHostCuda = std::chrono::steady_clock::now();
       const float* srcDevice = static_cast<const float*>(src->getPixelData());
       float* dstDevice = static_cast<float*>(dst->getPixelData());
       const int srcRb = src->getRowBytes();
       const int dstRb = dst->getRowBytes();
-      const size_t srcRowBytes = srcRb < 0 ? static_cast<size_t>(-srcRb) : static_cast<size_t>(srcRb);
-      const size_t dstRowBytes = dstRb < 0 ? static_cast<size_t>(-dstRb) : static_cast<size_t>(dstRb);
+      if (srcRb <= 0 || dstRb <= 0) {
+        OFX::throwSuiteStatusException(kOfxStatErrUnsupported);
+      }
+      const size_t srcRowBytes = static_cast<size_t>(srcRb);
+      const size_t dstRowBytes = static_cast<size_t>(dstRb);
       if (srcDevice != nullptr && dstDevice != nullptr &&
           processor_->renderCUDAHostBuffers(srcDevice, dstDevice, width, height, srcRowBytes, dstRowBytes, args.pCudaStream)) {
         if (needHostReadableInputCloud || canUpdateInputCloudCache) {
@@ -2598,6 +2644,9 @@ void render(const OFX::RenderArguments& args) override {
     // - This is the intended AMD/Windows fast fallback after CUDA is unavailable or disabled.
     // - Uses host cl_mem buffers and host command queue, so it avoids CPU staging copies.
     if (args.isEnabledOpenCLRender) {
+      if (!fullFrameHostGpuLayout) {
+        OFX::throwSuiteStatusException(kOfxStatErrUnsupported);
+      }
       if (hostOpenCLDisabled() || args.pOpenCLCmdQ == nullptr) {
         if (debugLogEnabled()) {
           std::fprintf(
@@ -2620,8 +2669,11 @@ void render(const OFX::RenderArguments& args) override {
       void* dstOpenCLBuffer = dst->getPixelData();
       const int srcRb = src->getRowBytes();
       const int dstRb = dst->getRowBytes();
-      const size_t srcRowBytes = srcRb < 0 ? static_cast<size_t>(-srcRb) : static_cast<size_t>(srcRb);
-      const size_t dstRowBytes = dstRb < 0 ? static_cast<size_t>(-dstRb) : static_cast<size_t>(dstRb);
+      if (srcRb <= 0 || dstRb <= 0) {
+        OFX::throwSuiteStatusException(kOfxStatErrUnsupported);
+      }
+      const size_t srcRowBytes = static_cast<size_t>(srcRb);
+      const size_t dstRowBytes = static_cast<size_t>(dstRb);
       const bool needHostOpenCLReadback = needFirstCloudHandoff || canUpdateInputCloudCache;
       if (srcOpenCLBuffer != nullptr && dstOpenCLBuffer != nullptr &&
           processor_->renderOpenCLHostBuffers(
@@ -2694,13 +2746,19 @@ void render(const OFX::RenderArguments& args) override {
     const bool tryHostMetal =
         preferHostMetal && !bypassHostMetalForCubeViewerCloud && args.isEnabledMetalRender && (args.pMetalCmdQ != nullptr);
     if (tryHostMetal) {
+      if (!fullFrameHostGpuLayout) {
+        OFX::throwSuiteStatusException(kOfxStatErrUnsupported);
+      }
       const auto tHostMetal = std::chrono::steady_clock::now();
       const void* srcMetalBuffer = src->getPixelData();
       void* dstMetalBuffer = dst->getPixelData();
       const int srcRb = src->getRowBytes();
       const int dstRb = dst->getRowBytes();
-      const size_t srcRowBytes = srcRb < 0 ? static_cast<size_t>(-srcRb) : static_cast<size_t>(srcRb);
-      const size_t dstRowBytes = dstRb < 0 ? static_cast<size_t>(-dstRb) : static_cast<size_t>(dstRb);
+      if (srcRb <= 0 || dstRb <= 0) {
+        OFX::throwSuiteStatusException(kOfxStatErrUnsupported);
+      }
+      const size_t srcRowBytes = static_cast<size_t>(srcRb);
+      const size_t dstRowBytes = static_cast<size_t>(dstRb);
       bool hostMetalRendered = false;
       const bool needHostMetalReadback = needFirstCloudHandoff || canUpdateInputCloudCache;
       if (srcMetalBuffer != nullptr && dstMetalBuffer != nullptr) {
@@ -2893,6 +2951,10 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
       if (suppressParamChanged_) {
         return;
       }
+      // Dynamic UI state belongs to host-owned change actions, including
+      // timeline changes for animated toggles. Cached setters keep this cheap.
+      updateToggleVisibility(args.time);
+      syncCubeViewerOverflowUi(args.time);
       if (args.reason == OFX::eChangeTime) {
         return;
       }
@@ -2916,10 +2978,14 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
       // All actions here are non-blocking and on-demand.
       if (paramName == "openCubeViewer") {
         openCubeViewerSession(args.time);
+        // The session handshake runs in this legal host-owned callback, so
+        // expose its final status immediately without worker-thread OFX calls.
+        flushPendingCubeViewerStatusLabel();
         return;
       }
       if (paramName == "closeCubeViewer") {
         closeCubeViewerSession();
+        flushPendingCubeViewerStatusLabel();
         return;
       }
       if (paramName == "cubeViewerLive") {
@@ -2955,7 +3021,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         if (getBool("cubeViewerIdentity", args.time, 1) == 0) {
           cubeViewerInputCloudRefreshPending_ = true;
           cubeViewerInputCloudHandoffQueued_.store(false, std::memory_order_relaxed);
-          cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+          resetCubeViewerInputCloudThrottle();
         }
         if (cubeViewerRequested_ && cubeViewerLive_) {
           pushCubeViewerUpdate(args.time, paramName, true);
@@ -2971,7 +3037,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         if (getBool("cubeViewerIdentity", args.time, 1) == 0) {
           cubeViewerInputCloudRefreshPending_ = true;
           cubeViewerInputCloudHandoffQueued_.store(false, std::memory_order_relaxed);
-          cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+          resetCubeViewerInputCloudThrottle();
         }
         if (cubeViewerRequested_ && cubeViewerLive_) {
           pushCubeViewerUpdate(args.time, paramName, true);
@@ -2997,7 +3063,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         cubeViewerInputCloudRefreshPending_ = !identityMode;
         cubeViewerInputCloudHandoffQueued_.store(false, std::memory_order_relaxed);
         if (!identityMode) {
-          cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+          resetCubeViewerInputCloudThrottle();
           cubeViewerDebugLog("Cube viewer input-cloud handoff armed from cubeViewerIdentity toggle.");
         }
         if (cubeViewerRequested_ && cubeViewerLive_) {
@@ -3018,7 +3084,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         cubeViewerInputCloudRefreshPending_ = !identityMode;
         cubeViewerInputCloudHandoffQueued_.store(false, std::memory_order_relaxed);
         if (!identityMode) {
-          cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+          resetCubeViewerInputCloudThrottle();
           cubeViewerDebugLog("Cube viewer input-cloud handoff armed from cubeViewerSource toggle.");
         }
         if (cubeViewerRequested_ && cubeViewerLive_) {
@@ -4847,16 +4913,19 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
   }
 
   void setCubeViewerStatusLabel(const std::string& status) {
-    if (cubeViewerStatusCache_ == status) return;
-    cubeViewerStatusCache_ = status;
-    cubeViewerDebugLog(std::string("Cube viewer status -> ") + status);
     {
       std::lock_guard<std::mutex> lock(cubeViewerStatusMutex_);
+      if (cubeViewerStatusCache_ == status) return;
+      cubeViewerStatusCache_ = status;
       cubeViewerStatusPending_ = status;
       cubeViewerStatusDirty_ = true;
     }
-    if (!allowUiParamWrites_) return;
-    setParamSetNeedsSyncing();
+    cubeViewerDebugLog(std::string("Cube viewer status -> ") + status);
+  }
+
+  std::string cubeViewerStatusSnapshot() {
+    std::lock_guard<std::mutex> lock(cubeViewerStatusMutex_);
+    return cubeViewerStatusCache_;
   }
 
   void flushPendingCubeViewerStatusLabel() {
@@ -4878,14 +4947,17 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     cubeViewerStatusMonitorStop_.store(false, std::memory_order_relaxed);
     cubeViewerStatusMonitorThread_ = std::thread([this]() {
       cubeViewerStatusMonitorRunning_.store(true, std::memory_order_relaxed);
-      while (!cubeViewerStatusMonitorStop_.load(std::memory_order_relaxed)) {
-        if (cubeViewerRequested_ || cubeViewerConnected_ || cubeViewerProcessId_ != 0) {
-          refreshCubeViewerConnectionHealth();
-          // Resolve UI may not repaint read-only param widgets unless we push value writes proactively.
-          // Keep this best-effort; pending/dedup logic avoids redundant writes.
-          flushPendingCubeViewerStatusLabel();
+      try {
+        while (!cubeViewerStatusMonitorStop_.load(std::memory_order_relaxed)) {
+          if (cubeViewerRequested_ || cubeViewerConnected_ || cubeViewerProcessId_ != 0) {
+            refreshCubeViewerConnectionHealth();
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "[ME_OpenDRT] Cube viewer status worker stopped: %s\n", e.what());
+      } catch (...) {
+        std::fprintf(stderr, "[ME_OpenDRT] Cube viewer status worker stopped after an unknown error.\n");
       }
       cubeViewerStatusMonitorRunning_.store(false, std::memory_order_relaxed);
     });
@@ -4903,7 +4975,8 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     cubeViewerIoStop_.store(false, std::memory_order_relaxed);
     cubeViewerIoThread_ = std::thread([this]() {
       cubeViewerIoRunning_.store(true, std::memory_order_relaxed);
-      for (;;) {
+      try {
+        for (;;) {
         std::string paramsJson;
         std::string paramsStatus;
         CachedCubeViewerInputCloud cloudPayload{};
@@ -4951,6 +5024,23 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
             cubeViewerWindowUsable_ = false;
             setCubeViewerStatusLabel("Disconnected");
             cubeViewerDebugLog("Cube viewer params payload send failed.");
+            // Viewer startup can exceed the short launch probe window on any
+            // backend. Retain the latest immutable snapshot and retry on this
+            // transport worker; never ask a worker to read OFX parameters.
+            const bool retrySnapshot =
+                cubeViewerRequested_.load(std::memory_order_relaxed) &&
+                !cubeViewerIoStop_.load(std::memory_order_relaxed);
+            if (retrySnapshot) {
+              std::lock_guard<std::mutex> lock(cubeViewerIoMutex_);
+              if (!cubeViewerPendingParams_) {
+                cubeViewerPendingParamsJson_ = paramsJson;
+                cubeViewerPendingParamsStatus_ = paramsStatus;
+                cubeViewerPendingParams_ = true;
+              }
+            }
+            if (retrySnapshot) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
           }
         }
 
@@ -4987,6 +5077,21 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
           }
           cubeViewerCloudSendActive_.store(false, std::memory_order_relaxed);
         }
+        }
+      } catch (const std::exception& e) {
+        std::fprintf(stderr, "[ME_OpenDRT] Cube viewer I/O worker stopped: %s\n", e.what());
+        cubeViewerConnected_ = false;
+        cubeViewerWindowUsable_ = false;
+        cubeViewerCloudSendActive_.store(false, std::memory_order_relaxed);
+        cubeViewerInputCloudHandoffQueued_.store(false, std::memory_order_relaxed);
+        try { setCubeViewerStatusLabel("Disconnected"); } catch (...) {}
+      } catch (...) {
+        std::fprintf(stderr, "[ME_OpenDRT] Cube viewer I/O worker stopped after an unknown error.\n");
+        cubeViewerConnected_ = false;
+        cubeViewerWindowUsable_ = false;
+        cubeViewerCloudSendActive_.store(false, std::memory_order_relaxed);
+        cubeViewerInputCloudHandoffQueued_.store(false, std::memory_order_relaxed);
+        try { setCubeViewerStatusLabel("Disconnected"); } catch (...) {}
       }
       cubeViewerIoRunning_.store(false, std::memory_order_relaxed);
     });
@@ -5063,6 +5168,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
   }
 
   void disconnectCubeViewerSessionLocal(const std::string& status) {
+    std::lock_guard<std::recursive_mutex> healthLock(cubeViewerHealthMutex_);
     cubeViewerRequested_ = false;
     cubeViewerConnected_ = false;
     cubeViewerProcessId_ = 0;
@@ -5070,8 +5176,9 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     cubeViewerLastStateVisible_ = false;
     cubeViewerLastStateMinimized_ = false;
     cubeViewerLastStateFocused_ = false;
+    cubeViewerLaunchGraceUntil_ = std::chrono::steady_clock::time_point::min();
     cubeViewerLastHeartbeatAt_ = std::chrono::steady_clock::time_point::min();
-    cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+    resetCubeViewerInputCloudThrottle();
     cubeViewerLastRenderProbeAt_ = std::chrono::steady_clock::time_point::min();
     cubeViewerHeartbeatFailCount_ = 0;
     cubeViewerRenderProbeFailCount_ = 0;
@@ -5085,9 +5192,16 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     setCubeViewerStatusLabel(status);
   }
 
-  // UI-thread heartbeat: keeps status label truthful and detects stale/disconnected viewer sessions.
+  // Background health checks update plugin-owned state only. A host-owned
+  // callback later applies the pending label to the OFX parameter.
 void refreshCubeViewerConnectionHealth() {
+    std::lock_guard<std::recursive_mutex> healthLock(cubeViewerHealthMutex_);
     if (!cubeViewerRequested_) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (cubeViewerLaunchGraceUntil_ != std::chrono::steady_clock::time_point::min() &&
+        now < cubeViewerLaunchGraceUntil_) {
+      return;
+    }
 #if defined(_WIN32)
     if (cubeViewerProcessId_ != 0) {
       HANDLE hProc = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(cubeViewerProcessId_));
@@ -5105,7 +5219,6 @@ void refreshCubeViewerConnectionHealth() {
       }
     }
 #endif
-    const auto now = std::chrono::steady_clock::now();
     if (cubeViewerLastHeartbeatAt_ != std::chrono::steady_clock::time_point::min()) {
       const auto elapsedMs =
           std::chrono::duration_cast<std::chrono::milliseconds>(now - cubeViewerLastHeartbeatAt_).count();
@@ -5137,9 +5250,11 @@ void refreshCubeViewerConnectionHealth() {
       }
       if (!cubeViewerWindowUsable_) {
         setCubeViewerStatusLabel("Connected (idle)");
-      } else if (cubeViewerStatusCache_ == "Disconnected" || cubeViewerStatusCache_.find("failed") != std::string::npos ||
-                 cubeViewerStatusCache_ == "Connected (idle)") {
-        setCubeViewerStatusLabel("Connected");
+      } else {
+        const std::string status = cubeViewerStatusSnapshot();
+        if (status == "Disconnected" || status.find("failed") != std::string::npos || status == "Connected (idle)") {
+          setCubeViewerStatusLabel("Connected");
+        }
       }
     } else {
       ++cubeViewerHeartbeatFailCount_;
@@ -5249,6 +5364,7 @@ std::string buildCubeViewerParamsJson(double time, bool deltaOnly, const std::st
 
   // Update throttle gate for param snapshots/deltas to protect host responsiveness under rapid scrubbing.
 bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedParam, double time) {
+    std::lock_guard<std::mutex> lock(cubeViewerThrottleMutex_);
     if (!cubeViewerRequested_) return false;
     if (!forceSnapshot && !cubeViewerLive_) return false;
     const auto now = std::chrono::steady_clock::now();
@@ -5263,6 +5379,7 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
   }
 
   bool cubeViewerInputCloudThrottleOpen() const {
+    std::lock_guard<std::mutex> lock(cubeViewerThrottleMutex_);
     const auto now = std::chrono::steady_clock::now();
     if (cubeViewerLastCloudSendAt_ == std::chrono::steady_clock::time_point::min()) return true;
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - cubeViewerLastCloudSendAt_).count();
@@ -5274,7 +5391,13 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
   }
 
   void noteCubeViewerInputCloudAttempt() {
+    std::lock_guard<std::mutex> lock(cubeViewerThrottleMutex_);
     cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::now();
+  }
+
+  void resetCubeViewerInputCloudThrottle() {
+    std::lock_guard<std::mutex> lock(cubeViewerThrottleMutex_);
+    cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
   }
 
   bool cubeViewerSteadyStateCloudPipelineAvailable() {
@@ -5632,6 +5755,7 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
   }
 
   void maybeCaptureCubeViewerInputCloudCache(const CachedCubeViewerInputCloud& payload) {
+    std::lock_guard<std::recursive_mutex> lock(cubeViewerCacheMutex_);
     cubeViewerCachedInputCloud_ = payload;
     cubeViewerCachedInputCloud_.valid = true;
   }
@@ -5646,6 +5770,7 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
   }
 
   bool trySendCachedCubeViewerInputCloud(double time, const char* reason) {
+    std::lock_guard<std::recursive_mutex> lock(cubeViewerCacheMutex_);
     if (!cubeViewerRequested_ || !cubeViewerLive_) return false;
     if (getBool("cubeViewerIdentity", time, 1) != 0) return false;
     if (!cubeViewerInputCloudRefreshPending_) return false;
@@ -5734,11 +5859,12 @@ void pushCubeViewerUpdate(double time, const std::string& changedParam, bool for
 
   // Session open flow: attach to existing viewer if reachable, otherwise launch and handshake.
 void openCubeViewerSession(double time) {
+    std::lock_guard<std::recursive_mutex> healthLock(cubeViewerHealthMutex_);
     cubeViewerRequested_ = true;
     cubeViewerLive_ = getBool("cubeViewerLive", time, 1) != 0;
     cubeViewerQuality_ = getChoice("cubeViewerQuality", time, 1);
     cubeViewerLastHeartbeatAt_ = std::chrono::steady_clock::time_point::min();
-    cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+    resetCubeViewerInputCloudThrottle();
     cubeViewerLastRenderProbeAt_ = std::chrono::steady_clock::time_point::min();
     cubeViewerHeartbeatFailCount_ = 0;
     cubeViewerRenderProbeFailCount_ = 0;
@@ -5746,10 +5872,12 @@ void openCubeViewerSession(double time) {
     cubeViewerLastStateVisible_ = true;
     cubeViewerLastStateMinimized_ = false;
     cubeViewerLastStateFocused_ = true;
+    cubeViewerLaunchGraceUntil_ = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     setCubeViewerStatusLabel("Launching");
     if (connectCubeViewerWithRetry(3, 40)) {
       cubeViewerConnected_ = true;
       cubeViewerWindowUsable_ = true;
+      cubeViewerLaunchGraceUntil_ = std::chrono::steady_clock::time_point::min();
       setCubeViewerStatusLabel("Connected");
       (void)sendCubeViewerMessage("{\"type\":\"open_session\"}");
       (void)sendCubeViewerMessage("{\"type\":\"bring_to_front\"}");
@@ -5763,6 +5891,7 @@ void openCubeViewerSession(double time) {
     if (!launchCubeViewerProcessAsync(&launchError, &launchedPath, &launchedPid)) {
       cubeViewerConnected_ = false;
       cubeViewerWindowUsable_ = false;
+      cubeViewerLaunchGraceUntil_ = std::chrono::steady_clock::time_point::min();
       setCubeViewerStatusLabel("Launch failed");
       if (debugLogEnabled()) {
         std::fprintf(stderr, "[ME_OpenDRT] Cube viewer launch failed: %s\n", launchError.c_str());
@@ -5770,12 +5899,14 @@ void openCubeViewerSession(double time) {
       return;
     }
     cubeViewerProcessId_ = launchedPid;
+    cubeViewerLaunchGraceUntil_ = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     if (debugLogEnabled()) {
       std::fprintf(stderr, "[ME_OpenDRT] Cube viewer launched from: %s\n", launchedPath.c_str());
     }
     if (connectCubeViewerWithRetry(18, 40)) {
       cubeViewerConnected_ = true;
       cubeViewerWindowUsable_ = true;
+      cubeViewerLaunchGraceUntil_ = std::chrono::steady_clock::time_point::min();
       setCubeViewerStatusLabel("Connected");
       const std::string openMsg = "{\"type\":\"open_session\"}";
       (void)sendCubeViewerMessage(openMsg);
@@ -5786,10 +5917,14 @@ void openCubeViewerSession(double time) {
     cubeViewerConnected_ = false;
     cubeViewerWindowUsable_ = false;
     setCubeViewerStatusLabel("Launched (awaiting connection)");
+    // Always queue the host-owned snapshot. The I/O worker retains and retries
+    // it until the newly launched viewer's IPC endpoint becomes ready.
+    pushCubeViewerUpdate(time, "openCubeViewer", true);
   }
 
   // Session close flow: local disconnect only (viewer process remains independent by design).
 void closeCubeViewerSession() {
+    std::lock_guard<std::recursive_mutex> healthLock(cubeViewerHealthMutex_);
     if (!cubeViewerRequested_ && !cubeViewerConnected_ && cubeViewerProcessId_ == 0) {
       return;
     }
@@ -5894,6 +6029,7 @@ void closeCubeViewerSession() {
 
   OFX::Clip* dstClip_ = nullptr;
   OFX::Clip* srcClip_ = nullptr;
+  std::mutex renderMutex_;
   std::unique_ptr<OpenDRTProcessor> processor_;
   std::vector<float> srcPixels_;
   std::vector<float> dstPixels_;
@@ -5924,17 +6060,18 @@ void closeCubeViewerSession() {
   bool menuLabelCwpModified_ = false;
   bool menuLabelDisplayModified_ = false;
   int lutExportFormatCache_ = 0;
-  bool cubeViewerRequested_ = false;
-  bool cubeViewerConnected_ = false;
-  uint32_t cubeViewerProcessId_ = 0;
-  bool cubeViewerLive_ = true;
-  bool cubeViewerWindowUsable_ = false;
-  bool cubeViewerInputCloudRefreshPending_ = false;
+  std::atomic<bool> cubeViewerRequested_{false};
+  std::atomic<bool> cubeViewerConnected_{false};
+  std::atomic<uint32_t> cubeViewerProcessId_{0};
+  std::atomic<bool> cubeViewerLive_{true};
+  std::atomic<bool> cubeViewerWindowUsable_{false};
+  std::atomic<bool> cubeViewerInputCloudRefreshPending_{false};
   CachedCubeViewerInputCloud cubeViewerCachedInputCloud_{};
-  bool cubeViewerLastStateVisible_ = true;
-  bool cubeViewerLastStateMinimized_ = false;
-  bool cubeViewerLastStateFocused_ = true;
-  int cubeViewerQuality_ = 1;
+  std::recursive_mutex cubeViewerCacheMutex_;
+  std::atomic<bool> cubeViewerLastStateVisible_{true};
+  std::atomic<bool> cubeViewerLastStateMinimized_{false};
+  std::atomic<bool> cubeViewerLastStateFocused_{true};
+  std::atomic<int> cubeViewerQuality_{1};
   std::atomic<uint64_t> cubeViewerSeq_{1};
   std::string cubeViewerStatusCache_ = "Disconnected";
   std::mutex cubeViewerStatusMutex_;
@@ -5957,9 +6094,12 @@ void closeCubeViewerSession() {
   std::string cubeViewerPendingCloudReason_;
   bool cubeViewerPendingCloudIsFirstHandoff_ = false;
   std::atomic<bool> cubeViewerInputCloudHandoffQueued_{false};
-  bool allowUiParamWrites_ = true;
+  std::atomic<bool> allowUiParamWrites_{true};
+  mutable std::mutex cubeViewerThrottleMutex_;
+  std::recursive_mutex cubeViewerHealthMutex_;
   std::string cubeViewerLastParam_;
   std::chrono::steady_clock::time_point cubeViewerLastSendAt_ = std::chrono::steady_clock::time_point::min();
+  std::chrono::steady_clock::time_point cubeViewerLaunchGraceUntil_ = std::chrono::steady_clock::time_point::min();
   std::chrono::steady_clock::time_point cubeViewerLastHeartbeatAt_ = std::chrono::steady_clock::time_point::min();
   std::chrono::steady_clock::time_point cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
   std::chrono::steady_clock::time_point cubeViewerLastRenderProbeAt_ = std::chrono::steady_clock::time_point::min();
@@ -5978,7 +6118,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   // ===== Plugin Descriptor =====
   // Host capability advertisement and static metadata.
   void describe(OFX::ImageEffectDescriptor& d) override {
-static const std::string nameWithVersion = "ME_OpenDRT v1.2.13";
+static const std::string nameWithVersion = "ME_OpenDRT v1.2.14";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -5987,6 +6127,9 @@ static const std::string nameWithVersion = "ME_OpenDRT v1.2.13";
     d.addSupportedContext(OFX::eContextFilter);
     d.addSupportedBitDepth(OFX::eBitDepthFloat);
     d.setSingleInstance(false);
+    // Reusable processor and staging resources are owned per effect instance.
+    // Different instances may render concurrently; one instance is serialized.
+    d.setRenderThreadSafety(OFX::eRenderInstanceSafe);
     d.setSupportsTiles(false);
     d.setSupportsMultiResolution(false);
     d.setTemporalClipAccess(false);
@@ -6295,7 +6438,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     cubeViewerQuality->appendOption("Low");
     cubeViewerQuality->appendOption("Medium");
     cubeViewerQuality->appendOption("High");
-    cubeViewerQuality->setDefault(0);
+    cubeViewerQuality->setDefault(1);
     cubeViewerQuality->setParent(*grpCubeViewer);
     if (const char* hint = tooltipForParam("cubeViewerQuality")) cubeViewerQuality->setHint(hint);
 
@@ -6386,7 +6529,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
     supportOfxVersion->setLabel("OFX version");
-    supportOfxVersion->setDefault("v1.2.13");
+    supportOfxVersion->setDefault("v1.2.14");
     supportOfxVersion->setEnabled(false);
     supportOfxVersion->setParent(*grpSupportRoot);
   }

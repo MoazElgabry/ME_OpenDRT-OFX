@@ -185,7 +185,7 @@ std::string pointDrawSourceLabel(bool useComputeIdentityBuffers,
   return "none";
 }
 
-const char* kViewerVersionString = "v1.2.13";
+const char* kViewerVersionString = "v1.2.14";
 
 #if defined(_WIN32)
 void applyWindowsWindowIcon(GLFWwindow* window) {
@@ -2616,7 +2616,7 @@ int runApp() {
   glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 #endif
 
-  GLFWwindow* window = glfwCreateWindow(864, 560, "ME_OpenDRT Cube Viewer", nullptr, nullptr);
+  GLFWwindow* window = glfwCreateWindow(700, 560, "ME_OpenDRT Cube Viewer", nullptr, nullptr);
   if (!window) {
     logViewerEvent("glfwCreateWindow() failed");
     glfwTerminate();
