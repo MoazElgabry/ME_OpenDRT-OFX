@@ -20,6 +20,18 @@ This project is based on OpenDRT and is distributed under **GNU GPL v3**.
 
 ## Installation
 
+### Option 1: Automated Installation & Updates via MCNexus (macOS & Windows)
+
+You can install, activate, and keep **ME_OpenDRT** updated automatically on **macOS** and **Windows** using **MCNexus**,
+no manual `.ofx.bundle` copying or Terminal permission commands required.
+
+1. **Get your license key & MCNexus:**
+   - Go to [get.mcnexus.app/me-opendrt](https://get.mcnexus.app/me-opendrt?utm_source=github&utm_medium=readme&utm_content=moaz-me-opendrt) and sign in with GitHub to generate your free key (download links for MCNexus are provided right there).
+2. **Activate & Install:**
+   - Open **MCNexus**, paste your key, and click **Install**. MCNexus handles permissions, future updates, and version rollbacks automatically.
+
+### Option 2: Manual Installation (Windows, macOS & Linux)
+
 1. Download the latest portable build for your platform from the latest release or [here](https://github.com/MoazElgabry/ME_OFX/tree/main/ME_OpenDRT).
 2. Copy `ME_OpenDRT.ofx.bundle` to your OFX plugin directory:
    - Windows: `C:\Program Files\Common Files\OFX\Plugins\`
